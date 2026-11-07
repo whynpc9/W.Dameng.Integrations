@@ -36,8 +36,21 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
             throw new NotSupportedException("Dameng MERGE does not support FlexLabs RunAndReturn.");
 
         var row = entities.Single();
+        var sourceColumns = row.Select(column => column.ColumnName).ToHashSet(StringComparer.Ordinal);
+        if (joinColumns.Count == 0 || joinColumns.Any(column => !sourceColumns.Contains(column.ColumnName)))
+            throw new NotSupportedException("Dameng upsert requires match columns mapped in the MERGE source.");
+        if (updateExpressions?.Any(expression => joinColumns.Any(
+            column => column.ColumnName == expression.ColumnName)) == true)
+        {
+            throw new NotSupportedException("Dameng MERGE cannot update a match column.");
+        }
+
         var source = string.Join(", ", row.Select(column =>
-            (column.DefaultSql ?? ExpandValue(column.Value)) + " AS " + EscapeName(column.ColumnName)));
+        {
+            var parameter = ExpandValue(column.Value);
+            var value = column.DefaultSql is null ? parameter : $"COALESCE({parameter}, {column.DefaultSql})";
+            return value + " AS " + EscapeName(column.ColumnName);
+        }));
         var predicate = string.Join(" AND ", joinColumns.Select(column =>
         {
             var name = EscapeName(column.ColumnName);
@@ -48,8 +61,8 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
         }));
         var insertColumns = row.Where(column => column.AllowInserts)
             .Select(column => EscapeName(column.ColumnName)).ToArray();
-        if (insertColumns.Length == 0 || joinColumns.Count == 0)
-            throw new NotSupportedException("Dameng upsert requires insertable columns and a match key.");
+        if (insertColumns.Length == 0)
+            throw new NotSupportedException("Dameng upsert requires insertable columns.");
 
         var sql = $"MERGE INTO {tableName} t USING (SELECT {source} FROM DUAL) s ON ({predicate})"
             + " WHEN NOT MATCHED THEN INSERT (" + string.Join(", ", insertColumns)
@@ -61,18 +74,47 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
             if (updateCondition is not null)
                 sql += " WHERE " + ExpandExpression(updateCondition);
         }
+        else if (updateCondition is not null)
+        {
+            // An empty update projection can still carry condition parameters.
+            // Reference those bindings in a tautology without evaluating the condition.
+            var bindings = updateCondition.GetConstantValues().Select(value =>
+            {
+                var parameter = ExpandValue(value);
+                return $"({parameter} IS NULL OR {parameter} IS NOT NULL)";
+            }).ToArray();
+            if (bindings.Length != 0)
+                sql += " WHERE " + string.Join(" AND ", bindings);
+        }
 
         return sql;
     }
 
     protected override string ExpandExpression(KnownExpression expression, Func<string, string>? expandLeftColumn = null)
-        => expression.ExpressionType switch
+    {
+        if (expression.ExpressionType is ExpressionType.Equal or ExpressionType.NotEqual)
+        {
+            var leftNull = expression.Value1 is ConstantValue { Value: null };
+            var rightNull = expression.Value2 is ConstantValue { Value: null };
+            if (leftNull || rightNull)
+            {
+                var operand = rightNull ? expression.Value1 : expression.Value2!;
+                var nullValue = rightNull ? expression.Value2! : expression.Value1;
+                // FlexLabs still supplies the null as a binding. WDriver rejects
+                // unused bindings, so include the known-null parameter in the test.
+                return $"({IsNullExpression(operand, expression.ExpressionType == ExpressionType.NotEqual)}"
+                    + $" AND {ExpandValue(nullValue)} IS NULL)";
+            }
+        }
+
+        return expression.ExpressionType switch
         {
             ExpressionType.And => Function("BITAND", expression, expandLeftColumn),
             ExpressionType.Or => Function("BITOR", expression, expandLeftColumn),
             ExpressionType.Modulo => Function("MOD", expression, expandLeftColumn),
             _ => base.ExpandExpression(expression, expandLeftColumn)
         };
+    }
 
     private string Function(string name, KnownExpression expression, Func<string, string>? expandLeftColumn)
         => name + "(" + ExpandValue(expression.Value1, expandLeftColumn)
@@ -81,6 +123,9 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
     public override int Run<TEntity>(DbContext dbContext, IEntityType entityType,
         ICollection<TEntity> entities, UpsertCommandArgs<TEntity> commandArgs)
     {
+        if (entities.Count == 0)
+            return 0;
+
         var database = dbContext.Database;
         var current = database.CurrentTransaction;
         ValidateTransaction(database, current);
@@ -94,13 +139,25 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
         {
             database.ExecuteSqlRaw(LockTable(entityType));
             var affected = base.Run(dbContext, entityType, entities, commandArgs);
+            if (savepoint is not null)
+                current!.ReleaseSavepoint(savepoint);
             owned?.Commit();
             return affected;
         }
-        catch
+        catch (Exception failure)
         {
             if (savepoint is not null)
-                current!.RollbackToSavepoint(savepoint);
+            {
+                try
+                {
+                    current!.RollbackToSavepoint(savepoint);
+                    current.ReleaseSavepoint(savepoint);
+                }
+                catch (Exception recoveryFailure)
+                {
+                    throw new AggregateException("Dameng upsert and savepoint recovery both failed.", failure, recoveryFailure);
+                }
+            }
             throw;
         }
     }
@@ -108,6 +165,9 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
     public override async Task<int> RunAsync<TEntity>(DbContext dbContext, IEntityType entityType,
         ICollection<TEntity> entities, UpsertCommandArgs<TEntity> commandArgs, CancellationToken cancellationToken)
     {
+        if (entities.Count == 0)
+            return 0;
+
         var database = dbContext.Database;
         var current = database.CurrentTransaction;
         ValidateTransaction(database, current);
@@ -124,14 +184,26 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
             await database.ExecuteSqlRawAsync(LockTable(entityType), cancellationToken).ConfigureAwait(false);
             var affected = await base.RunAsync(dbContext, entityType, entities, commandArgs, cancellationToken)
                 .ConfigureAwait(false);
+            if (savepoint is not null)
+                await current!.ReleaseSavepointAsync(savepoint, CancellationToken.None).ConfigureAwait(false);
             if (owned is not null)
                 await owned.CommitAsync(cancellationToken).ConfigureAwait(false);
             return affected;
         }
-        catch
+        catch (Exception failure)
         {
             if (savepoint is not null)
-                await current!.RollbackToSavepointAsync(savepoint, CancellationToken.None).ConfigureAwait(false);
+            {
+                try
+                {
+                    await current!.RollbackToSavepointAsync(savepoint, CancellationToken.None).ConfigureAwait(false);
+                    await current.ReleaseSavepointAsync(savepoint, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception recoveryFailure)
+                {
+                    throw new AggregateException("Dameng upsert and savepoint recovery both failed.", failure, recoveryFailure);
+                }
+            }
             throw;
         }
     }
@@ -157,6 +229,6 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
     {
         if (entityType.GetTableName() is null)
             throw new NotSupportedException("Dameng upsert requires a physical table.");
-        return "LOCK TABLE " + GetTableName(entityType) + " IN SHARE ROW EXCLUSIVE MODE";
+        return "LOCK TABLE " + GetTableName(entityType) + " IN EXCLUSIVE MODE";
     }
 }
