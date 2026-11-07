@@ -2,6 +2,8 @@
 
 适用于 .NET 10，支持版本固定为 Hangfire.Core 1.8.23 和 W.DamengProvider 0.3.1。这是 ADO.NET 存储组件，应用可直接传入同版本的 Hangfire.AspNetCore 配置。库内不需要 EF Core，也无需加载官方达梦驱动。
 
+运行时包将 Newtonsoft.Json 的最低版本设为实库验收所用的 13.0.3，避免 Hangfire.Core 的传递依赖解析到受影响的 11.0.1。[GHSA-5crp-9r3c-p9vr](https://github.com/advisories/GHSA-5crp-9r3c-p9vr)
+
 ```csharp
 using Hangfire;
 using W.Hangfire.Dameng;
