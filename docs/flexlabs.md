@@ -9,7 +9,7 @@ using W.FlexLabs.Upsert.Dameng;
 options.UseDamengWithWDriver(connectionString).UseDamengUpsert();
 ```
 
-接入使用 FlexLabs 的 `ReplaceUpsertCommandRunner<DamengUpsertCommandRunner>()`。注册应和 WDriver 配置放在同一个 DbContext 的 options 构建中。目标表使用主键或能唯一定位行的匹配列。批量按输入顺序执行 MERGE，使用一个 ReadCommitted 事务持有目标表的写锁。外层已有 EF 事务时复用该事务，失败回退至保存点。调用方负责提交外层事务，表锁随事务释放。
+接入使用 FlexLabs 的 `ReplaceUpsertCommandRunner<DamengUpsertCommandRunner>()`。注册应和 WDriver 配置放在同一个 DbContext 的 options 构建中。
 
 ## 执行语义
 
@@ -25,6 +25,10 @@ scripts/flexlabs/run.sh provision
 scripts/flexlabs/run.sh test
 ```
 
-provision 从授权的本地文件读取管理员连接，仅用官方驱动执行管理操作。它创建独立的随机用户/schema、随机密码和专用默认表空间，校验 WDriver 登录和默认表空间，把所有权与连接配置保存到本 worktree 忽略的 `.local/` 文件，权限为 0600。测试只使用这份隔离配置。重复 provision 会验证已就绪的环境。创建过程中断时会保留未就绪的记录供检查。
+provision 从授权的本地文件读取管理员连接，仅用官方驱动执行管理操作。它创建独立的随机用户/schema、随机密码和专用默认表空间，校验 WDriver 登录、当前 schema 和默认表空间，把所有权与连接配置保存到本 worktree 忽略的 `.local/` 文件，权限为 0600。测试只使用这份隔离配置。重复 provision 会验证已就绪的环境。创建过程中断时会保留未就绪的记录供检查。
 
 测试使用 FlexLabs 公开 API 和独立连接读回，包含带转换的字段、Unicode、CLOB、NULL、复合键、默认值、实际行数、批量顺序、冲突后的回滚和重用、外层事务、六连接竞争、锁等待超时和取消。TickerQ 测试通过发布包 `TickerQ.EntityFrameworkCore` 10.1.1 的 `ITickerPersistenceProvider.QueueCronTickerOccurrences` 调用实际持久化路径，同一复合键只返回并持久化一个 occurrence。
+
+实库验收共 14 项，14 通过、0 失败、0 跳过。锁等待用例确认超时或取消后未写入竞争行，原 DbContext 可继续使用。批次取消用例在首条 MERGE 成功后、第二条命令发送前触发取消，并分别验证自有事务的整批回滚，以及外层事务中先前写入的保留、后续写入和提交。
+
+Astra High 独立审查了 runner、隔离配置和测试快照，未发现阻塞问题。审查指出了首条 MERGE 成功后批次取消的覆盖缺口，已补测两种事务路径。

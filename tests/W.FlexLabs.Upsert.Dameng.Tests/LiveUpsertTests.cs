@@ -31,7 +31,8 @@ public sealed class LiveUpsertTests : IClassFixture<LiveDatabase>
         Assert.True(context.Database.ProviderName == "W.EntityFrameworkCore.Dameng.WDriver");
 
         Assert.Equal(1, context.Rows.Upsert(NewRow(1, 1, 9)).NoUpdate().Run());
-        Assert.Equal(0, context.Rows.Upsert(NewRow(1, 1, 99)).NoUpdate().Run());
+        Assert.Equal(0, context.Rows.Upsert(NewRow(1, 1, 99))
+            .UpdateIf(existing => existing.Counter < 10).NoUpdate().Run());
 
         using var reader = _database.CreateContext();
         Assert.Equal(9, reader.Rows.Single(row => row.Bucket == 1).Counter);
@@ -122,8 +123,9 @@ public sealed class LiveUpsertTests : IClassFixture<LiveDatabase>
         conflicts.Part = 3;
         conflicts.UniqueCode = existing.UniqueCode;
 
-        await Assert.ThrowsAsync<DmException>(
+        var violation = await Assert.ThrowsAsync<DmException>(
             () => context.Rows.UpsertRange(wouldInsert, conflicts).NoUpdate().RunAsync());
+        Assert.Equal(-6602, violation.Number);
 
         await using var reader = _database.CreateContext();
         Assert.Equal(new[] { existing.Id }, await reader.Rows.Where(row => row.Bucket == 5)
@@ -146,8 +148,9 @@ public sealed class LiveUpsertTests : IClassFixture<LiveDatabase>
         conflicts.Part = 3;
         conflicts.UniqueCode = existing.UniqueCode;
 
-        await Assert.ThrowsAsync<DmException>(
+        var violation = await Assert.ThrowsAsync<DmException>(
             () => context.Rows.UpsertRange(wouldInsert, conflicts).NoUpdate().RunAsync());
+        Assert.Equal(-6602, violation.Number);
         var valid = NewRow(6, 4, 1);
         valid.Part = 4;
         Assert.Equal(1, await context.Rows.Upsert(valid).NoUpdate().RunAsync());
@@ -237,6 +240,71 @@ public sealed class LiveUpsertTests : IClassFixture<LiveDatabase>
         Assert.Equal(2, await reader.Rows.CountAsync(row => row.Bucket == held.Bucket, deadline.Token));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Cancellation_between_batch_rows_rolls_back_only_the_batch(bool callerTransaction)
+    {
+        using var request = new CancellationTokenSource();
+        var interceptor = new CancelSecondMerge(request);
+        await using var context = _database.CreateContext(interceptor);
+        await using var transaction = callerTransaction
+            ? await context.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted)
+            : null;
+        var bucket = callerTransaction ? 13 : 12;
+        var prior = NewRow(bucket, 1, 1);
+        if (transaction is not null)
+        {
+            context.Rows.Add(prior);
+            await context.SaveChangesAsync();
+        }
+
+        var first = NewRow(bucket, 2, 2);
+        first.Part = 2;
+        var second = NewRow(bucket, 3, 3);
+        second.Part = 3;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            context.Rows.UpsertRange(first, second).NoUpdate().RunAsync(request.Token));
+        Assert.Equal(1, interceptor.CompletedMerges);
+
+        if (transaction is null)
+            Assert.Null(context.Database.CurrentTransaction);
+        var recovered = NewRow(bucket, 4, 4);
+        recovered.Part = 4;
+        Assert.Equal(1, await context.Rows.Upsert(recovered).NoUpdate().RunAsync());
+        if (transaction is not null)
+            await transaction.CommitAsync();
+
+        await using var reader = _database.CreateContext();
+        var ids = await reader.Rows.Where(row => row.Bucket == bucket).OrderBy(row => row.Id)
+            .Select(row => row.Id).ToArrayAsync();
+        Assert.Equal(callerTransaction ? new[] { prior.Id, recovered.Id } : [recovered.Id], ids);
+    }
+
+    private sealed class CancelSecondMerge(CancellationTokenSource request) : DbCommandInterceptor
+    {
+        public int CompletedMerges { get; private set; }
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(DbCommand command,
+            CommandEventData eventData, InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (IsMerge(command) && CompletedMerges == 1 && !request.IsCancellationRequested)
+                request.Cancel();
+            return ValueTask.FromResult(result);
+        }
+
+        public override ValueTask<int> NonQueryExecutedAsync(DbCommand command, CommandExecutedEventData eventData,
+            int result, CancellationToken cancellationToken = default)
+        {
+            if (IsMerge(command) && result == 1)
+                CompletedMerges++;
+            return ValueTask.FromResult(result);
+        }
+
+        private static bool IsMerge(DbCommand command)
+            => command.CommandText.StartsWith("MERGE INTO ", StringComparison.Ordinal);
+    }
+
     private sealed class LockObserver : DbCommandInterceptor
     {
         public TaskCompletionSource LockStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -305,6 +373,7 @@ public sealed class LiveDatabase : IDisposable
 {
     private readonly DbContextOptions<LiveContext> _options;
     private readonly string _connection;
+    private readonly string _schema;
     private readonly string _tableName = "FLEX_PROBE_" + Guid.NewGuid().ToString("N").ToUpperInvariant();
 
     private string TickerTableName => _tableName + "_TQ";
@@ -330,8 +399,11 @@ public sealed class LiveDatabase : IDisposable
             }
 
             _connection = root.GetProperty("ConnectionString").GetString()!;
+            _schema = user;
             Table = $"\"{_tableName}\"";
             Assert.True(Equals(Scalar("SELECT USER FROM DUAL"), user), "Incorrect session user.");
+            Assert.True(Equals(Scalar("SELECT SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID()) FROM DUAL"), user),
+                "Incorrect current schema.");
             Assert.True(Equals(Scalar("SELECT DEFAULT_TABLESPACE FROM USER_USERS"), tablespace), "Incorrect tablespace.");
             _options = new DbContextOptionsBuilder<LiveContext>()
                 .UseDamengWithWDriver(_connection)
@@ -379,7 +451,7 @@ public sealed class LiveDatabase : IDisposable
     public string Table { get; }
     internal LiveContext CreateContext(DbCommandInterceptor? observer = null)
         => new(observer is null ? _options : new DbContextOptionsBuilder<LiveContext>(_options)
-            .AddInterceptors(observer).Options, _tableName, TickerTableName);
+            .AddInterceptors(observer).Options, _tableName, TickerTableName, _schema);
 
     internal object? Scalar(string sql)
     {
@@ -418,14 +490,15 @@ internal sealed class LiveContextFactory(LiveDatabase database) : IDbContextFact
     public LiveContext CreateDbContext() => database.CreateContext();
 }
 
-internal sealed class LiveContext(DbContextOptions<LiveContext> options, string tableName, string tickerTableName)
+internal sealed class LiveContext(DbContextOptions<LiveContext> options, string tableName, string tickerTableName,
+    string schema)
     : DbContext(options)
 {
     public DbSet<Item> Rows => Set<Item>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        var entity = modelBuilder.Entity<Item>().ToTable(tableName);
+        var entity = modelBuilder.Entity<Item>().ToTable(tableName, schema);
         entity.Property(row => row.Id).ValueGeneratedNever();
         entity.Property(row => row.UniqueCode).HasMaxLength(80);
         entity.Property(row => row.State).HasMaxLength(8).HasConversion(
@@ -438,7 +511,7 @@ internal sealed class LiveContext(DbContextOptions<LiveContext> options, string 
 
         var ticker = modelBuilder.Entity<CronTickerOccurrenceEntity<CronTickerEntity>>();
         new CronTickerOccurrenceConfigurations<CronTickerEntity>().Configure(ticker);
-        ticker.ToTable(tickerTableName, schema: null);
+        ticker.ToTable(tickerTableName, schema);
         // This fixture exercises the occurrence queue without the scheduler's parent tables.
         ticker.Ignore(row => row.CronTicker);
         modelBuilder.Ignore<CronTickerEntity>();

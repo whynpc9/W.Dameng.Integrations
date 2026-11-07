@@ -10,8 +10,9 @@ case "${1:-}" in
   provision)
     shift
     project=scripts/flexlabs/Provision/Provision.csproj
-    dotnet build "$project" "${flags[@]}" "$@"
-    dotnet scripts/flexlabs/Provision/bin/Debug/net10.0/Provision.dll
+    output="$PWD/.local/flexlabs-provision"
+    dotnet build "$project" "${flags[@]}" "$@" --output "$output"
+    dotnet "$output/Provision.dll"
     ;;
   test)
     shift

@@ -63,8 +63,11 @@ try
     step = "verifying WDriver login and tablespace ownership";
     using var client = new W.Dm.DmConnection(isolation.ConnectionString);
     client.Open();
-    if (!Equals(Scalar(client, "SELECT USER FROM DUAL"), isolation.User))
-        throw new InvalidOperationException("Unexpected current user.");
+    if (!Equals(Scalar(client, "SELECT USER FROM DUAL"), isolation.User)
+        || !Equals(Scalar(client, "SELECT SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID()) FROM DUAL"), isolation.User))
+    {
+        throw new InvalidOperationException("Unexpected current user or schema.");
+    }
     var provisioned = new Dm.DmConnectionStringBuilder(adminString)
     {
         ["UID"] = isolation.User,
@@ -90,6 +93,7 @@ static object? Scalar(System.Data.Common.DbConnection connection, string sql)
 {
     using var command = connection.CreateCommand();
     command.CommandText = sql;
+    command.CommandTimeout = 30;
     return command.ExecuteScalar();
 }
 
@@ -97,6 +101,7 @@ static void Execute(System.Data.Common.DbConnection connection, string sql)
 {
     using var command = connection.CreateCommand();
     command.CommandText = sql;
+    command.CommandTimeout = 30;
     command.ExecuteNonQuery();
 }
 
