@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <IntegrationReadme Condition="'$(MSBuildProjectName)' == 'W.FlexLabs.Upsert.Dameng'">flexlabs.md</IntegrationReadme>
+    <IntegrationReadme Condition="'$(MSBuildProjectName)' == 'W.TickerQ.Dameng'">tickerq.md</IntegrationReadme>
+    <IntegrationReadme Condition="'$(MSBuildProjectName)' == 'W.Hangfire.Dameng'">hangfire.md</IntegrationReadme>
+    <IntegrationReadme Condition="'$(MSBuildProjectName)' == 'W.OpenIddict.Dameng'">openiddict.md</IntegrationReadme>
+    <PackageReadmeFile Condition="'$(IntegrationReadme)' != ''">README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(IntegrationReadme)' != ''">
+    <None Include="$(MSBuildThisFileDirectory)docs/$(IntegrationReadme)" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+</Project>

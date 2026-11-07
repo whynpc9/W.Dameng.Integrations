@@ -1,0 +1,12 @@
+<Solution>
+  <Project Path="src/W.FlexLabs.Upsert.Dameng/W.FlexLabs.Upsert.Dameng.csproj" />
+  <Project Path="src/W.Hangfire.Dameng/W.Hangfire.Dameng.csproj" />
+  <Project Path="src/W.OpenIddict.Dameng/W.OpenIddict.Dameng.csproj" />
+  <Project Path="src/W.TickerQ.Dameng/W.TickerQ.Dameng.csproj" />
+  <Project Path="tests/W.Dameng.Identity.Tests/W.Dameng.Identity.Tests.csproj" />
+  <Project Path="tests/W.Dameng.NamingConventions.Tests/W.Dameng.NamingConventions.Tests.csproj" />
+  <Project Path="tests/W.FlexLabs.Upsert.Dameng.Tests/W.FlexLabs.Upsert.Dameng.Tests.csproj" />
+  <Project Path="tests/W.Hangfire.Dameng.Tests/W.Hangfire.Dameng.Tests.csproj" />
+  <Project Path="tests/W.OpenIddict.Dameng.Tests/W.OpenIddict.Dameng.Tests.csproj" />
+  <Project Path="tests/W.TickerQ.Dameng.Tests/W.TickerQ.Dameng.Tests.csproj" />
+</Solution>

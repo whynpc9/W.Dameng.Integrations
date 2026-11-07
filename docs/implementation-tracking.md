@@ -2,14 +2,14 @@
 
 基线：2026-11-07；主仓库 `main`。每个库由独立 `gpt-6.1-sol` High worktree 会话实现，并由 `gpt-6-astra` High subagent 审查。主会话负责核对结果和合并。
 
-| 集成 | 会话 ID | 初始状态 |
+| 集成 | 会话 ID | 合并与验收状态 |
 | --- | --- | --- |
-| FlexLabs Upsert | `01a1b647-6749-7220-b8d2-abee408f1d75` | 实施中 |
-| TickerQ | `01a1b647-69be-7ea2-bf4c-79417075a174` | 实施中，依赖 FlexLabs runner |
-| Hangfire | `01a1b647-7288-7070-aee5-b701a05b0b2f` | 实施中 |
-| OpenIddict | `01a1b647-7294-7f81-9029-b501db7e905f` | 实施中 |
-| Identity | `01a1b647-766b-7c33-805f-20d01a37f85d` | 实施中 |
-| NamingConventions | `01a1b647-78dc-7563-ac4c-1182e4b4b04f` | 实施中 |
+| FlexLabs Upsert | `01a1b647-6749-7220-b8d2-abee408f1d75` | 已合并 `2acab93`；主分支 14/14 |
+| TickerQ | `01a1b647-69be-7ea2-bf4c-79417075a174` | 已合并 `5ffb0cf`；主分支 5/5 |
+| Hangfire | `01a1b647-7288-7070-aee5-b701a05b0b2f` | 已合并 `662b44d`；10 项均有通过证据，见下文 |
+| OpenIddict | `01a1b647-7294-7f81-9029-b501db7e905f` | 已合并 `da9f964`；主分支 10/10 |
+| Identity | `01a1b647-766b-7c33-805f-20d01a37f85d` | 已合并 `7650346`；主分支 7/7 |
+| NamingConventions | `01a1b647-78dc-7563-ac4c-1182e4b4b04f` | 已合并 `99a61cd`；主分支 11/11 |
 
 ## 合并标准
 
@@ -20,3 +20,33 @@
 5. 主会话检查差异及证据，合并到 main 后进行组合构建和必要的集成复验。
 
 隔离测试库位于已有达梦实例内，通过各自的用户/schema 与表空间隔离；并未为每库部署新的达梦服务器实例。所有凭据保存在忽略的本地配置中。
+
+## 审查与复验方法
+
+六个实现会话均要求独立 `gpt-6-astra` High 子代理检查实际差异和测试，按反馈修复或补充覆盖。主会话另外检查了提交差异、关键事务代码和文档，按依赖顺序使用非快进合并保留每库历史。TickerQ 的运行时代码引用 FlexLabs 适配项目，最终 FlexLabs 追加提交只修改测试、隔离脚本和文档。
+
+主分支复验在各库会话结束后接管其独有测试库，避免同时运行同一份夹具。前五项主分支 TRX 原始结果保存在忽略的 `artifacts/acceptance/<library>/`，共 47 项通过、0 失败、0 跳过。隔离回执检查确认 6 个不同用户/schema、6 个不同表空间，所有回执权限均为 `0600`。
+
+OpenIddict 主分支首次复验因只转移了隔离回执、缺少 provision 创建的本地互斥文件而在夹具初始化失败；执行其幂等 provision 重新核验并建立本地互斥文件后，全套 10 项通过。此处没有改动运行时代码或重新分配测试库。
+
+## Hangfire 验收记录
+
+运行时 C# 代码在 `a293b75`；`65189af` 仅调整重启用例的 cron 到期窗口；最终 `662b44d` 将包依赖下限对齐到已验收的 Newtonsoft.Json 13.0.3。该库完整回归为 9 通过、1 失败、0 跳过（`artifacts/acceptance/hangfire/acceptance.log`），唯一失败是高频 cron 重复产生作业导致测试排空超时；修订测试后定向复验为 1 通过、0 失败、0 跳过（`restart-retest.log`），仍由真实调度器处理到期作业。两轮实现会话构建的存储 DLL 校验值一致。Astra High 对运行时代码及最后的测试修订分别复审。
+
+主会话核对原始日志计数、两个提交间的唯一测试差异，并验证合并后的 Hangfire 源码与已验收分支完全一致。未重复执行未变化的 10 项实库测试。合计 57 个不同用例均有通过证据；这不是一次 57/57 的单轮运行记录。
+
+## 实际支持边界
+
+WDriver 扩展为 0.5.0-preview.1。FlexLabs 同表写入由排他表锁串行化，Hangfire 同 schema 写事务由 WRITER 行锁串行化。Hangfire 提交应答丢失未做实库故障注入；存储层不重放提交，Hangfire 上层仍可能重试。OpenIddict HTTP 认证流程、Identity Passkey、既有业务库升级等不在本次存储层验收内。NamingConventions 的显式 history schema 幂等脚本存在 provider 0.5.0 限制。各库文档给出具体可用路径和版本条件。
+
+## 包依赖修正
+
+最终组合构建发现 Hangfire 运行时项目原先解析 Newtonsoft.Json 11.0.1 并触发 NU1903，而实库测试始终解析 13.0.3。`662b44d` 增加显式 13.0.3 下限，运行时和测试解析图均对齐。原 Astra High 审查者对该元数据和文档修订复审无发现，测试使用的 Newtonsoft DLL 逐字节未变化，因此沿用原实库验收。
+
+## 最终集成与打包验证
+
+`W.Dameng.Integrations.slnx` 包含 4 个运行时项目和 6 个测试项目；`scripts/build.sh` 的最终 Release 构建为 0 警告、0 错误。四个本地 `0.1.0-preview.1` NuGet 包生成于忽略的 `artifacts/packages/`，均包含对应接入文档。
+
+独立消费项目仅通过 NuGet 包引用编译四个集成的公开注册 API；另一个只引用 Hangfire 适配包的项目也编译通过。两者均为 0 警告、0 错误，均解析 Newtonsoft.Json 13.0.3。使用单独的任务缓存重新读取本次生成的四个包，逐一确认缓存中的包哈希与产物一致、包内 DLL 与 Release 构建输出逐字节一致。原始校验记录位于 `artifacts/acceptance/package-validation.json`。消费验证范围是依赖恢复和编译，实库行为由上述各库测试验证。
+
+全部实现及增量依赖修复已合并到本地 `main`。没有推送远程、发布 NuGet 包或修改相邻 UniWeb/provider 仓库。各库的独立 worktree 与隔离测试库保留，便于后续复验。
