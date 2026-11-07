@@ -1,3 +1,4 @@
+using System.Globalization;
 using Hangfire;
 using Hangfire.Common;
 using Hangfire.States;
@@ -64,8 +65,14 @@ public sealed partial class StorageTests
         var antecedent = client.Create(Job.FromExpression(() => Work.Record(queue, "parent", 0)), new EnqueuedState(queue));
         var continuation = client.ContinueJobWith(antecedent, () => Work.Record(queue, "child", 0), new EnqueuedState(queue));
         var failure = client.Create(Job.FromExpression(() => Work.Fail()), new EnqueuedState(queue));
-        recurring.AddOrUpdate(queue, Job.FromExpression(() => Work.Record(queue, "recurring", 0), queue), "*/45 * * * * *",
-            new RecurringJobOptions());
+        // Schedule one real cron occurrence within the test window. The next
+        // occurrence is a year later, so a slow run cannot accumulate extra work.
+        DateTime firstOccurrence;
+        using (var clock = (JobStorageConnection)store.GetConnection())
+            firstOccurrence = clock.GetUtcDateTime().AddMinutes(1);
+        var cron = firstOccurrence.ToString("ss mm HH dd MM", CultureInfo.InvariantCulture) + " *";
+        recurring.AddOrUpdate(queue, Job.FromExpression(() => Work.Record(queue, "recurring", 0), queue), cron,
+            new RecurringJobOptions { TimeZone = TimeZoneInfo.Utc });
 
         try
         {
@@ -83,12 +90,12 @@ public sealed partial class StorageTests
                 await Until(() => new[] { delayed, antecedent, continuation }.All(x => State(x) == "Succeeded")
                     && State(failure) == "Failed"
                     && Number("SELECT COUNT(*) FROM WHF_TEST_EXECUTION WHERE RUN_ID = :p0 AND RESULT_VALUE = 'recurring'", queue) > 0,
-                    TimeSpan.FromSeconds(150));
+                    TimeSpan.FromSeconds(180));
                 recurring.RemoveIfExists(queue);
                 await Until(() => before.EnqueuedCount(queue) == 0 && before.FetchedCount(queue) == 0);
             }
 
-            foreach (var value in new[] { "delayed", "parent", "child" })
+            foreach (var value in new[] { "delayed", "parent", "child", "recurring" })
                 Assert.Equal(1, Number("SELECT COUNT(*) FROM WHF_TEST_EXECUTION WHERE RUN_ID = :p0 AND RESULT_VALUE = :p1", queue, value));
             Assert.Contains(before.FailedJobs(0, 100), x => x.Key == failure && x.Value.ExceptionType == "System.InvalidOperationException");
             Assert.Equal("Succeeded", before.JobDetails(continuation).History[0].StateName);
