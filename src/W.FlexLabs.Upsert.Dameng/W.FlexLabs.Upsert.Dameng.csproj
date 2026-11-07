@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Dameng WDriver command runner for FlexLabs EF Core Upsert.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="FlexLabs.EntityFrameworkCore.Upsert" Version="[10.1.0]" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.12" />
+    <PackageReference Include="W.EntityFrameworkCore.Dameng.WDriver" Version="[0.5.0-preview.1]" />
+  </ItemGroup>
+</Project>
