@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>OpenIddict 6.3 EF Core store integration for Dameng with WDriver.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="OpenIddict.EntityFrameworkCore" Version="[6.3.0]" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="[10.0.12,11.0.0)" />
+    <PackageReference Include="W.EntityFrameworkCore.Dameng" Version="[0.5.0]" />
+    <PackageReference Include="W.EntityFrameworkCore.Dameng.WDriver" Version="[0.5.0-preview.1]" />
+    <PackageReference Include="W.DamengProvider" Version="[0.3.1]" />
+  </ItemGroup>
+</Project>
