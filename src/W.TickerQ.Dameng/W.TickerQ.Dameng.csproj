@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Dameng EF Core operational storage configuration for TickerQ 10.1.1.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../W.FlexLabs.Upsert.Dameng/W.FlexLabs.Upsert.Dameng.csproj" />
+    <PackageReference Include="TickerQ" Version="[10.1.1]" />
+    <PackageReference Include="TickerQ.EntityFrameworkCore" Version="[10.1.1]" />
+    <PackageReference Include="TickerQ.Utilities" Version="[10.1.1]" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.12" />
+    <PackageReference Include="W.EntityFrameworkCore.Dameng" Version="[0.5.0]" />
+    <PackageReference Include="W.EntityFrameworkCore.Dameng.WDriver" Version="[0.5.0-preview.1]" />
+    <PackageReference Include="W.DamengProvider" Version="[0.3.1]" />
+  </ItemGroup>
+</Project>
