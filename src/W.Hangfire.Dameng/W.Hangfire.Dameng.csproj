@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Dameng job storage for Hangfire.Core 1.8.23 using W.DamengProvider.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Hangfire.Core" Version="[1.8.23]" />
+    <PackageReference Include="W.DamengProvider" Version="[0.3.1]" />
+  </ItemGroup>
+</Project>
