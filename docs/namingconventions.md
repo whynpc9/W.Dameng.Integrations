@@ -34,6 +34,15 @@ scripts/namingconventions/run.sh provision
 scripts/namingconventions/run.sh test
 ```
 
+`test` 将子命令后的参数原样传给 `dotnet test`，并带上单节点构建和 locked restore 参数。`provision` 不接收附加参数。以下命令筛选迁移用例，使用 Release 配置，并把 TRX 写入忽略的本地目录。
+
+```sh
+scripts/namingconventions/run.sh test -c Release \
+  --filter 'FullyQualifiedName~Migration_reruns_and_two_connections_can_reapply_after_rollback' \
+  --logger 'trx;LogFileName=naming-f07.trx' \
+  --results-directory '.local/namingconventions/F07 results'
+```
+
 `provision` 只从仓库约定的本地设置读取管理员连接，在 DM 实例中创建一个随机命名的用户及其 schema 和专属默认表空间。它为该用户独立生成密码，将所有权和 WDriver 连接写入忽略的 `.local/namingconventions/owned.json`（权限 `0600`）。重复运行会核对目录和 WDriver 当前 schema。若首次创建中断并留下未就绪记录，先检查记录及对应的达梦对象，再处理该次创建的对象。测试和脚本不会复用源设置的测试 schema。
 
 本地测试连接显式允许明文传输，以匹配验收实例。测试需要已就绪的隔离配置，缺少配置会失败。脚本串行化同一工作树的建库和测试；测试仅清理专属 schema 中由该夹具创建的具名对象。若进程被强制终止，确认没有残留的建库或测试进程后再移除本地 `run.lock` 目录。
