@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -49,7 +50,8 @@ internal sealed class LiveDatabase(Isolation isolation)
         }
     }
 
-    internal IHost CreateNode(string node, ITickerClock? clock = null, bool runScheduler = false)
+    internal IHost CreateNode(string node, ITickerClock? clock = null, bool runScheduler = false,
+        DbCommandInterceptor? interceptor = null)
     {
         var builder = Host.CreateApplicationBuilder();
         builder.Logging.ClearProviders();
@@ -68,6 +70,9 @@ internal sealed class LiveDatabase(Isolation isolation)
 
         if (clock is not null)
             builder.Services.AddSingleton(clock);
+
+        if (interceptor is not null)
+            builder.Services.ConfigureDbContext<DamengTickerQDbContext>(options => options.AddInterceptors(interceptor));
 
         return builder.Build();
     }
