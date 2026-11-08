@@ -1,0 +1,12 @@
+<Project>
+  <Target Name="RejectUnpatchedTickerQAssemblies" AfterTargets="ResolvePackageAssets">
+    <ItemGroup>
+      <_UnpatchedTickerQ Include="@(RuntimeCopyLocalItems)"
+        Condition="'%(RuntimeCopyLocalItems.NuGetPackageId)' == 'TickerQ'
+          Or '%(RuntimeCopyLocalItems.NuGetPackageId)' == 'TickerQ.Utilities'
+          Or '%(RuntimeCopyLocalItems.NuGetPackageId)' == 'TickerQ.EntityFrameworkCore'" />
+    </ItemGroup>
+    <Error Condition="'@(_UnpatchedTickerQ)' != ''"
+      Text="W.TickerQ.Dameng requires the matching W.TickerQ packages. Remove upstream TickerQ, TickerQ.Utilities and TickerQ.EntityFrameworkCore dependencies that provide the same assemblies." />
+  </Target>
+</Project>

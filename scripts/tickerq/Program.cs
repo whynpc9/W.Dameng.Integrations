@@ -7,7 +7,10 @@ const string adminFile = "/Users/wanghongyi/Projects/dameng-entityframework-core
 var phase = "initialization";
 try
 {
-    var local = Path.Combine(args.Single(), ".local", "tickerq");
+    var lane = args.Length == 1 ? "tickerq" : args[1];
+    if (args.Length is < 1 or > 2 || lane is not ("tickerq" or "tickerq-f14"))
+        throw new ArgumentException("Unknown TickerQ isolation lane.");
+    var local = Path.Combine(args[0], ".local", lane);
     Directory.CreateDirectory(local);
     using var gate = new FileStream(Path.Combine(local, "provision.lock"), FileMode.OpenOrCreate,
         FileAccess.ReadWrite, FileShare.None);

@@ -18,6 +18,11 @@ public sealed class DamengTickerQDbContext(DbContextOptions<DamengTickerQDbConte
         modelBuilder.ApplyConfiguration(new CronTickerOccurrenceConfigurations<CronTickerEntity>(schema: null));
 
         var time = modelBuilder.Entity<TimeTickerEntity>();
+#if TICKERQ_F14
+        time.Property(x => x.ClaimToken).HasDefaultValue(Guid.Empty).ValueGeneratedNever().IsConcurrencyToken();
+        time.Property(x => x.ClaimStarted).HasDefaultValue(false).ValueGeneratedNever().IsConcurrencyToken();
+        time.Property(x => x.Status).IsConcurrencyToken();
+#endif
         time.Property(x => x.Request).HasColumnType("BLOB");
         time.Property(x => x.ExceptionMessage).HasColumnType("NCLOB");
         time.Property(x => x.SkippedReason).HasColumnType("NCLOB");
