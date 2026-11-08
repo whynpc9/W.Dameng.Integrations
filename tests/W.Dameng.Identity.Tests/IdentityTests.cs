@@ -76,6 +76,79 @@ public sealed class IdentityTests(IdentityDatabase database) : IClassFixture<Ide
     }
 
     [Fact]
+    public async Task NativeUserManagerPersistsLockoutThresholdDeadlinesAndReset()
+    {
+        await using var writer = database.NewScope();
+        var users = writer.ServiceProvider.GetRequiredService<UserManager<IdentityUser>>();
+        var user = NewUser();
+        Succeeded(await users.CreateAsync(user, Password));
+        Assert.Null(await ReadLockoutStateAsync(enabled: true, failures: 0, locked: false));
+
+        var options = users.Options.Lockout;
+        for (var attempt = 1; attempt < options.MaxFailedAccessAttempts; attempt++)
+        {
+            Succeeded(await users.AccessFailedAsync(user));
+        }
+
+        Assert.Null(await ReadLockoutStateAsync(
+            enabled: true, failures: options.MaxFailedAccessAttempts - 1, locked: false));
+
+        var earliest = DateTimeOffset.UtcNow + options.DefaultLockoutTimeSpan;
+        Succeeded(await users.AccessFailedAsync(user));
+        var latest = DateTimeOffset.UtcNow + options.DefaultLockoutTimeSpan;
+        var thresholdEnd = await ReadLockoutStateAsync(enabled: true, failures: 0, locked: true);
+        Assert.NotNull(thresholdEnd);
+        Assert.InRange(thresholdEnd.Value, earliest, latest);
+
+        var past = new DateTimeOffset(2001, 1, 1, 0, 0, 0, TimeSpan.FromHours(8)).AddTicks(1234567);
+        Succeeded(await users.SetLockoutEndDateAsync(user, past));
+        Succeeded(await users.AccessFailedAsync(user));
+        Assert.Equal(past.UtcTicks,
+            (await ReadLockoutStateAsync(enabled: true, failures: 1, locked: false))?.UtcTicks);
+
+        Succeeded(await users.ResetAccessFailedCountAsync(user));
+        Assert.Equal(past.UtcTicks,
+            (await ReadLockoutStateAsync(enabled: true, failures: 0, locked: false))?.UtcTicks);
+
+        var future = new DateTimeOffset(2099, 12, 31, 23, 59, 59, new TimeSpan(-5, -30, 0)).AddTicks(7654321);
+        Succeeded(await users.SetLockoutEndDateAsync(user, future));
+        Assert.Equal(future.UtcTicks,
+            (await ReadLockoutStateAsync(enabled: true, failures: 0, locked: true))?.UtcTicks);
+
+        Succeeded(await users.SetLockoutEnabledAsync(user, false));
+        Assert.Equal(future.UtcTicks,
+            (await ReadLockoutStateAsync(enabled: false, failures: 0, locked: false))?.UtcTicks);
+
+        Succeeded(await users.SetLockoutEnabledAsync(user, true));
+        Succeeded(await users.SetLockoutEndDateAsync(user, null));
+        Assert.Null(await ReadLockoutStateAsync(enabled: true, failures: 0, locked: false));
+
+        async Task<DateTimeOffset?> ReadLockoutStateAsync(bool enabled, int failures, bool locked)
+        {
+            await using var readerScope = database.NewScope();
+            var readerUsers = readerScope.ServiceProvider.GetRequiredService<UserManager<IdentityUser>>();
+            var found = await readerUsers.FindByIdAsync(user.Id);
+            Assert.NotNull(found);
+            Assert.Equal(enabled, await readerUsers.GetLockoutEnabledAsync(found));
+            Assert.Equal(failures, await readerUsers.GetAccessFailedCountAsync(found));
+            Assert.Equal(locked, await readerUsers.IsLockedOutAsync(found));
+            var managerEnd = await readerUsers.GetLockoutEndDateAsync(found);
+
+            using var connection = database.OpenReadback();
+            using var command = Command(connection,
+                """SELECT "LockoutEnabled", "AccessFailedCount", "LockoutEnd" FROM "AspNetUsers" WHERE "Id" = :p0""",
+                null, [user.Id]);
+            using var row = command.ExecuteReader();
+            Assert.True(row.Read());
+            Assert.Equal(enabled, row.GetBoolean(0));
+            Assert.Equal(failures, row.GetInt32(1));
+            DateTimeOffset? databaseEnd = row.IsDBNull(2) ? null : row.GetFieldValue<DateTimeOffset>(2);
+            Assert.Equal(managerEnd?.UtcTicks, databaseEnd?.UtcTicks);
+            return managerEnd;
+        }
+    }
+
+    [Fact]
     public async Task ManagersRoundTripRolesClaimsLoginsTokensAndLongValues()
     {
         await using var writer = database.NewScope();
