@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Storage;
 using OpenIddict.Abstractions;
 using Xunit;
+using Xunit.Abstractions;
 using static OpenIddict.Abstractions.OpenIddictConstants;
 using static OpenIddict.Abstractions.OpenIddictExceptions;
 using Application = OpenIddict.EntityFrameworkCore.Models.OpenIddictEntityFrameworkCoreApplication;
@@ -15,7 +16,7 @@ using Token = OpenIddict.EntityFrameworkCore.Models.OpenIddictEntityFrameworkCor
 
 namespace W.OpenIddict.Dameng.Tests;
 
-public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
+public sealed partial class StoreTests(LiveDatabase live, ITestOutputHelper output) : IClassFixture<LiveDatabase>
 {
     private static readonly DateTimeOffset Old = new(2020, 1, 1, 0, 0, 0, TimeSpan.Zero);
     private static readonly DateTimeOffset Future = new(2099, 1, 1, 0, 0, 0, TimeSpan.Zero);
@@ -23,10 +24,41 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
     private static readonly string Subject = new('中', 400);
 
     [Fact]
+    public async Task ResetRejectsAnAlternateSchemaOwnedByTheSameUser()
+    {
+        await using var session = await live.OpenAsync();
+        var db = session.Db;
+        var alternate = "OID_GUARD_" + Guid.NewGuid().ToString("N")[..20].ToUpperInvariant();
+        // Both schemas belong to this fixture's user. The alternate schema has a same-named
+        // table so an unchecked first DELETE would succeed and remove the sentinel.
+#pragma warning disable EF1002 // Schema identifier is generated above from a hexadecimal GUID.
+        await db.Database.ExecuteSqlRawAsync($"""CREATE SCHEMA "{alternate}" """);
+        try
+        {
+            await db.Database.ExecuteSqlRawAsync($"""SET SCHEMA "{alternate}" """);
+            await db.Database.ExecuteSqlRawAsync("""CREATE TABLE "OpenIddictTokens" ("Sentinel" INT)""");
+            await db.Database.ExecuteSqlRawAsync("""INSERT INTO "OpenIddictTokens" VALUES (73)""");
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => live.ResetAsync(db));
+            Assert.Contains("Current user, schema or tablespace", exception.Message);
+            await using var reader = await live.OpenAsync();
+            Assert.Equal(73, await reader.Db.Database.SqlQueryRaw<int>(
+                $"""SELECT "Sentinel" AS "Value" FROM "{alternate}"."OpenIddictTokens" """).SingleAsync());
+        }
+        finally
+        {
+            await db.Database.CloseConnectionAsync();
+            await using var cleanup = await live.OpenAsync();
+            await cleanup.Db.Database.ExecuteSqlRawAsync($"""DROP SCHEMA "{alternate}" CASCADE""");
+        }
+#pragma warning restore EF1002
+    }
+
+    [Fact]
     public async Task NativeCrudAndLobRoundTrip()
     {
         await using var writer = await live.OpenAsync();
-        await LiveDatabase.ResetAsync(writer.Db);
+        await live.ResetAsync(writer.Db);
         var properties = JsonSerializer.SerializeToElement(LongText);
         const string redirect = "https://example.test/callback";
         const string logout = "https://example.test/signed-out";
@@ -108,12 +140,14 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task CascadeRejectsStaleRootAndCommitsAllDependents(bool deleteApplication)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task CascadeRejectsStaleSnapshotsAndCommitsAllDependents(bool deleteApplication, bool staleDependent)
     {
         await using var writer = await live.OpenAsync();
-        await LiveDatabase.ResetAsync(writer.Db);
+        await live.ResetAsync(writer.Db);
         var app = await CreateApplication(writer, "target");
         var other = await CreateApplication(writer, "other");
         var auth = await CreateAuthorization(writer, app.Id);
@@ -131,19 +165,28 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
         {
             var staleApp = await loser.Applications.FindByIdAsync(app.Id!);
             var staleAuth = await loser.Authorizations.FindByIdAsync(auth.Id!);
-            if (deleteApplication)
+            if (staleDependent)
+            {
+                Assert.IsType<Token>(await loser.Tokens.FindByIdAsync(children[0].Id!));
+                children[0].Payload = "updated dependent";
+                await writer.Tokens.UpdateAsync(children[0]);
+            }
+            else if (deleteApplication)
             {
                 app.DisplayName = "updated by another session";
                 await writer.Applications.UpdateAsync(app);
-                await Assert.ThrowsAsync<ConcurrencyException>(() => loser.Applications.DeleteAsync(staleApp!).AsTask());
             }
             else
             {
                 auth.Status = Statuses.Revoked;
                 await writer.Authorizations.UpdateAsync(auth);
-                await Assert.ThrowsAsync<ConcurrencyException>(() => loser.Authorizations.DeleteAsync(staleAuth!).AsTask());
             }
+
+            await Assert.ThrowsAsync<ConcurrencyException>(() => deleteApplication
+                ? loser.Applications.DeleteAsync(staleApp!).AsTask()
+                : loser.Authorizations.DeleteAsync(staleAuth!).AsTask());
             Assert.False(loser.Db.ChangeTracker.HasChanges());
+            Assert.Equal(0, await loser.Db.SaveChangesAsync());
         }
 
         await using (var reader = await live.OpenAsync())
@@ -151,6 +194,9 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
             Assert.Equal(2, await reader.Applications.CountAsync());
             Assert.Equal(2, await reader.Authorizations.CountAsync());
             Assert.Equal(5, await reader.Tokens.CountAsync());
+            if (staleDependent)
+                Assert.Equal("updated dependent", await reader.Tokens.GetPayloadAsync(
+                    (await reader.Tokens.FindByIdAsync(children[0].Id!))!));
         }
 
         await using (var retry = await live.OpenAsync())
@@ -177,7 +223,7 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
     public async Task AllRevokeRoutesAndStaleWriterProtection(bool tracked)
     {
         await using var writer = await live.OpenAsync(tracked);
-        await LiveDatabase.ResetAsync(writer.Db);
+        await live.ResetAsync(writer.Db);
         var app = await CreateApplication(writer, "selected");
         var byApplication = await CreateApplication(writer, "by-application");
         var other = await CreateApplication(writer, "other");
@@ -228,7 +274,7 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
     public async Task PruneAppliesPredicatesAndCountsCommittedRows(bool tracked)
     {
         await using var writer = await live.OpenAsync(tracked);
-        await LiveDatabase.ResetAsync(writer.Db);
+        await live.ResetAsync(writer.Db);
         var app = await CreateApplication(writer, "prune");
         var revoked = await CreateAuthorization(writer, app.Id, status: Statuses.Revoked);
         var permanent = await CreateAuthorization(writer, app.Id);
@@ -278,7 +324,7 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
     public async Task SerializableTrackedSaveHasIndependentCommitAndRollbackReadback()
     {
         await using var writer = await live.OpenAsync();
-        await LiveDatabase.ResetAsync(writer.Db);
+        await live.ResetAsync(writer.Db);
         var app = await CreateApplication(writer, "transaction");
         await Assert.ThrowsAsync<NotSupportedException>(() =>
             writer.Db.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead));
@@ -311,7 +357,7 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
     public async Task AdapterStopsWhenBeginFailsAndNativeCascadeCanPartiallyDelete()
     {
         await using var seed = await live.OpenAsync();
-        await LiveDatabase.ResetAsync(seed.Db);
+        await live.ResetAsync(seed.Db);
         var app = await CreateApplication(seed, "begin-failure");
         var token = await CreateToken(seed, app.Id, null, status: Statuses.Revoked);
         var adapterFault = new RejectSerializable();
@@ -354,7 +400,7 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
     public async Task TrackedPruneRollsBackAfterSaveAndRecoversOnRetry()
     {
         await using var writer = await live.OpenAsync();
-        await LiveDatabase.ResetAsync(writer.Db);
+        await live.ResetAsync(writer.Db);
         await CreateToken(writer, null, null, status: Statuses.Revoked);
         await CreateToken(writer, null, null, status: Statuses.Revoked);
         var fault = new FailAfterSave();
@@ -376,6 +422,90 @@ public sealed class StoreTests(LiveDatabase live) : IClassFixture<LiveDatabase>
 
         await using var reader = await live.OpenAsync();
         Assert.Equal(0, await reader.Tokens.CountAsync());
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task CancellationAfterDmlRollsBackAndAllowsRetry(bool deleteGraph)
+    {
+        await using var seed = await live.OpenAsync();
+        await live.ResetAsync(seed.Db);
+        var app = await CreateApplication(seed, "cancel");
+        var auth = await CreateAuthorization(seed, app.Id);
+        var first = await CreateToken(seed, app.Id, auth.Id);
+        var second = await CreateToken(seed, app.Id, null);
+
+        using var cancellation = new CancellationTokenSource();
+        var cancelAfterSave = new CancelAfterSave(cancellation);
+        await using (var failing = await live.OpenAsync(tracked: true, interceptor: cancelAfterSave))
+        {
+            var target = Assert.IsType<Application>(await failing.Applications.FindByIdAsync(app.Id!));
+            Task MaintainAsync(CancellationToken token) => deleteGraph
+                ? failing.Applications.DeleteAsync(target, token).AsTask()
+                : failing.Tokens.RevokeBySubjectAsync(Subject, token).AsTask();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => MaintainAsync(new CancellationToken(canceled: true)));
+            Assert.Equal(0, cancelAfterSave.RowsWritten);
+            var canceled = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => MaintainAsync(cancellation.Token));
+            Assert.Equal(cancellation.Token, canceled.CancellationToken);
+            Assert.Equal(deleteGraph ? 4 : 2, cancelAfterSave.RowsWritten);
+            Assert.Equal(IsolationLevel.Serializable, cancelAfterSave.Isolation);
+            Assert.Null(failing.Db.Database.CurrentTransaction);
+            Assert.False(failing.Db.ChangeTracker.HasChanges());
+            Assert.Equal(0, await failing.Db.SaveChangesAsync());
+        }
+
+        await using (var observer = await live.OpenAsync())
+        {
+            Assert.NotNull(await observer.Applications.FindByIdAsync(app.Id!));
+            Assert.NotNull(await observer.Authorizations.FindByIdAsync(auth.Id!));
+            var tokens = await observer.Db.Set<Token>().AsNoTracking().ToDictionaryAsync(row => row.Id!);
+            Assert.Equal(2, tokens.Count);
+            Assert.Equal((Statuses.Valid, first.ConcurrencyToken), (tokens[first.Id!].Status, tokens[first.Id!].ConcurrencyToken));
+            Assert.Equal((Statuses.Valid, second.ConcurrencyToken), (tokens[second.Id!].Status, tokens[second.Id!].ConcurrencyToken));
+        }
+
+        await using (var retry = await live.OpenAsync(tracked: true))
+        {
+            if (deleteGraph)
+                await retry.Applications.DeleteAsync((await retry.Applications.FindByIdAsync(app.Id!))!);
+            else
+                Assert.Equal(2, await retry.Tokens.RevokeBySubjectAsync(Subject));
+        }
+
+        await using var reader = await live.OpenAsync();
+        if (deleteGraph)
+        {
+            Assert.Equal(0, await reader.Applications.CountAsync());
+            Assert.Equal(0, await reader.Authorizations.CountAsync());
+            Assert.Equal(0, await reader.Tokens.CountAsync());
+        }
+        else
+        {
+            var rows = await reader.Db.Set<Token>().Select(row => row.Status).ToListAsync();
+            Assert.Equal(2, rows.Count);
+            Assert.All(rows, status => Assert.Equal(Statuses.Revoked, status));
+        }
+    }
+
+    private sealed class CancelAfterSave(CancellationTokenSource source) : SaveChangesInterceptor
+    {
+        public int RowsWritten { get; private set; }
+        public IsolationLevel? Isolation { get; private set; }
+
+        public override ValueTask<int> SavedChangesAsync(SaveChangesCompletedEventData eventData, int result,
+            CancellationToken cancellationToken = default)
+        {
+            // A subsequent zero-row SaveChanges in the same scope must remain harmless.
+            if (result > 0)
+            {
+                RowsWritten = result;
+                Isolation = eventData.Context?.Database.CurrentTransaction?.GetDbTransaction().IsolationLevel;
+                source.Cancel();
+            }
+            return ValueTask.FromResult(result);
+        }
     }
 
     private sealed class RejectedSave : InvalidOperationException;

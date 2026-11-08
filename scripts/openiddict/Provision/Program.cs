@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Dm;
+using W.OpenIddict.Dameng.Testing;
 
 var stage = "load local state";
 try
@@ -21,7 +22,7 @@ try
             return 1;
         }
 
-        Verify(saved);
+        await VerifyAsync(saved);
         return 0;
     }
 
@@ -74,8 +75,8 @@ try
     Execute(admin, $"GRANT RESOURCE TO \"{user}\"");
     Execute(admin, $"GRANT SOI TO \"{user}\"");
 
-    stage = "verify isolated login and default tablespace";
-    Verify(state);
+    stage = "verify isolated login, current schema and default tablespace";
+    await VerifyAsync(state);
     Save(statePath, state with { Status = "ready" });
     return 0;
 }
@@ -87,17 +88,12 @@ catch (Exception error)
     return 1;
 }
 
-static void Verify(SchemaState state)
+static async Task VerifyAsync(SchemaState state)
 {
-    using var connection = new W.Dm.DmConnection(state.ConnectionString);
-    connection.Open();
-    if (!Equals(Scalar(connection, "SELECT USER FROM DUAL"), state.User)
-        || !Equals(Scalar(connection, "SELECT DEFAULT_TABLESPACE FROM USER_USERS"), state.Tablespace))
-    {
-        throw new InvalidOperationException();
-    }
-
-    Console.WriteLine($"Isolated schema login and default tablespace verified on Dameng {connection.ServerVersion}.");
+    await using var connection = new W.Dm.DmConnection(state.ConnectionString);
+    await connection.OpenAsync();
+    await OwnedSchema.VerifyAsync(connection, state.User, state.Tablespace);
+    Console.WriteLine($"Isolated login, current schema and default tablespace verified on Dameng {connection.ServerVersion}.");
 }
 
 static object? Scalar(System.Data.Common.DbConnection connection, string sql)
