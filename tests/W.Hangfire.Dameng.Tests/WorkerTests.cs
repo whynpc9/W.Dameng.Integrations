@@ -29,6 +29,7 @@ public sealed partial class StorageTests
             .Select(i => client.Create(Job.FromExpression(() => Work.Record(queue, i.ToString(), 500)), new EnqueuedState(queue)))
             .Append(longJob).ToList();
 
+        using var observer = OpenVerified();
         using var first = StartServer(storage, queue, 1, "first", lightweight: true);
         using var second = StartServer(OpenWith(options), queue, 1, "second", lightweight: true);
         var monitoring = storage.GetMonitoringApi();
@@ -38,11 +39,17 @@ public sealed partial class StorageTests
             Assert.Equal(1, x.WorkersCount);
             Assert.NotNull(x.Heartbeat);
         });
-        await Until(() => State(longJob) == ProcessingState.StateName, TimeSpan.FromSeconds(75));
-        var leaseSql = "SELECT LEASE_UNTIL FROM WHF_QUEUE WHERE JOB_ID = :p0";
-        var initialLease = Assert.IsType<DateTime>(Scalar(leaseSql, Id(longJob)));
-        await Until(() => Scalar(leaseSql, Id(longJob)) is DateTime current && current > initialLease);
-        await Until(() => jobs.All(x => State(x) == SucceededState.StateName), TimeSpan.FromSeconds(150));
+        const string stateSql = "SELECT STATE_NAME FROM WHF_JOB WHERE ID = :p0";
+        await Until(() => Equals(Scalar(observer, stateSql, Id(longJob)), ProcessingState.StateName), TimeSpan.FromSeconds(75));
+        const string leaseSql = "SELECT LEASE_UNTIL FROM WHF_QUEUE WHERE JOB_ID = :p0";
+        var initialLease = Assert.IsType<DateTime>(Scalar(observer, leaseSql, Id(longJob)));
+        await Until(() => Scalar(observer, leaseSql, Id(longJob)) is DateTime current && current > initialLease);
+
+        var ids = jobs.Select(id => (object)Id(id)).ToArray();
+        var placeholders = string.Join(", ", ids.Select((_, i) => ":p" + i.ToString(CultureInfo.InvariantCulture)));
+        var succeededSql = $"SELECT COUNT(*) FROM WHF_JOB WHERE STATE_NAME = 'Succeeded' AND ID IN ({placeholders})";
+        await Until(() => Convert.ToInt64(Scalar(observer, succeededSql, ids), CultureInfo.InvariantCulture) == jobs.Count,
+            TimeSpan.FromSeconds(150));
 
         Assert.Equal(6, Number("SELECT COUNT(*) FROM WHF_TEST_EXECUTION WHERE RUN_ID = :p0", queue));
         Assert.Equal(6, Number("SELECT COUNT(DISTINCT RESULT_VALUE) FROM WHF_TEST_EXECUTION WHERE RUN_ID = :p0", queue));

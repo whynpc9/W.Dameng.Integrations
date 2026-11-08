@@ -18,8 +18,10 @@ internal sealed class DamengTransaction(DamengStorageConnection owner) : JobStor
         ObjectDisposedException.ThrowIf(_closed, this);
         var payload = DamengJobs.Payload(job);
         var snapshot = parameters.ToArray();
+        var createdUtc = createdAt.ToUniversalTime();
+        var expiresUtc = createdUtc + expireIn;
         var id = owner.Storage.Database.Read(s => s.NextId());
-        Add((s, now) => DamengJobs.Create(s, id, payload, createdAt.ToUniversalTime(), now + expireIn, snapshot));
+        Add((s, _) => DamengJobs.Create(s, id, payload, createdUtc, expiresUtc, snapshot));
         return Id(id);
     }
 

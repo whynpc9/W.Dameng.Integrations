@@ -17,13 +17,41 @@ internal sealed class DamengMonitoringApi(DamengDatabase database) : JobStorageM
 
     public override IList<QueueWithTopEnqueuedJobsDto> Queues() => database.Read(s =>
     {
-        var names = s.Query("SELECT DISTINCT QUEUE_NAME FROM WHF_QUEUE ORDER BY QUEUE_NAME", r => r.GetString(0));
-        return names.Select(name => new QueueWithTopEnqueuedJobsDto
+        var rows = s.Query($"""
+            WITH CLASSIFIED AS (
+                SELECT Q.ID, Q.JOB_ID, Q.QUEUE_NAME,
+                       CASE WHEN {Available} THEN 1 ELSE 0 END AS IS_AVAILABLE
+                FROM WHF_QUEUE Q
+            ), RANKED AS (
+                SELECT ID, JOB_ID, QUEUE_NAME, IS_AVAILABLE,
+                       SUM(IS_AVAILABLE) OVER (PARTITION BY QUEUE_NAME) AS AVAILABLE_COUNT,
+                       COUNT(*) OVER (PARTITION BY QUEUE_NAME) AS TOTAL_COUNT,
+                       ROW_NUMBER() OVER (PARTITION BY QUEUE_NAME ORDER BY IS_AVAILABLE DESC, ID) AS QUEUE_POSITION
+                FROM CLASSIFIED
+            )
+            SELECT {JobColumns}, R.QUEUE_NAME, R.AVAILABLE_COUNT, R.TOTAL_COUNT
+            FROM RANKED R
+            LEFT JOIN WHF_JOB J ON R.IS_AVAILABLE = 1 AND J.ID = R.JOB_ID
+            {CurrentState}
+            WHERE R.QUEUE_POSITION = 1 OR (R.IS_AVAILABLE = 1 AND R.QUEUE_POSITION <= 5)
+            ORDER BY R.QUEUE_NAME, R.QUEUE_POSITION
+            """, r => (
+            Name: r.GetString(5),
+            Length: r.GetInt64(6),
+            Total: r.GetInt64(7),
+            Job: r.IsDBNull(0) ? null : ReadRow(r)));
+
+        return rows.GroupBy(row => row.Name, StringComparer.Ordinal).Select(queue =>
         {
-            Name = name,
-            Length = QueueCount(s, name, Available),
-            Fetched = QueueCount(s, name, Fetched),
-            FirstJobs = QueueJobs(s, name, Available, 0, 5, ToEnqueued)
+            var first = queue.First();
+            return new QueueWithTopEnqueuedJobsDto
+            {
+                Name = queue.Key,
+                Length = first.Length,
+                Fetched = first.Total - first.Length,
+                FirstJobs = new JobList<EnqueuedJobDto>(queue.Where(row => row.Job is not null)
+                    .Select(row => Pair(row.Job!, x => ToEnqueued(x, null))))
+            };
         }).ToList();
     });
 
@@ -198,15 +226,26 @@ internal sealed class DamengMonitoringApi(DamengDatabase database) : JobStorageM
             SELECT {JobColumns} FROM WHF_JOB J {CurrentState} WHERE J.STATE_NAME = :p0 AND {DamengJobs.Active}
             ORDER BY J.ID {order} LIMIT :p1 OFFSET :p2
             """, ReadRow, state, count, from);
-        return new JobList<T>(rows.Select(row => Pair(row, x => project(x, includeParent ? ParentState(session, x) : null))));
+        var parents = includeParent ? ParentStates(session, rows) : null;
+        return new JobList<T>(rows.Select(row => Pair(row, x =>
+            project(x, parents?.GetValueOrDefault(ParentId(x))))));
     }
 
-    private static string? ParentState(SqlSession session, MonitorRow row)
+    private static Dictionary<long, string?> ParentStates(SqlSession session, List<MonitorRow> rows)
     {
-        if (!long.TryParse(row.Data.GetValueOrDefault("ParentId"), NumberStyles.None, CultureInfo.InvariantCulture, out var id))
-            return null;
-        return session.Scalar("SELECT STATE_NAME FROM WHF_JOB WHERE ID = :p0", id) as string;
+        var ids = rows.Select(ParentId).Where(id => id > 0).Distinct().ToArray();
+        if (ids.Length == 0) return [];
+
+        var predicate = SqlSession.InParameters("ID", ids.Length);
+        return session.Query($"SELECT ID, STATE_NAME FROM WHF_JOB WHERE {predicate}",
+                r => (Id: r.GetInt64(0), State: r.IsDBNull(1) ? null : r.GetString(1)),
+                [.. ids])
+            .ToDictionary(row => row.Id, row => row.State);
     }
+
+    private static long ParentId(MonitorRow row) =>
+        long.TryParse(row.Data.GetValueOrDefault("ParentId"), NumberStyles.None, CultureInfo.InvariantCulture, out var id)
+            ? id : 0;
 
     private static MonitorRow ReadRow(DmDataReader r)
     {
@@ -239,9 +278,17 @@ internal sealed class DamengMonitoringApi(DamengDatabase database) : JobStorageM
     {
         var now = s.UtcNow();
         var start = hourly ? now.Date.AddHours(now.Hour) : now.Date;
-        return Enumerable.Range(0, hourly ? 24 : 7)
+        var buckets = Enumerable.Range(0, hourly ? 24 : 7)
             .Select(offset => hourly ? start.AddHours(-offset) : start.AddDays(-offset))
-            .ToDictionary(date => date, date => DamengCollections.Counter(s, DamengJobs.Metric(metric, date, hourly)));
+            .ToDictionary(date => date, date => Key(DamengJobs.Metric(metric, date, hourly)));
+        var predicate = SqlSession.InParameters("K", buckets.Count);
+        var counts = s.Query($"""
+            SELECT K, SUM(DELTA) FROM WHF_COUNTER WHERE {predicate}
+              AND (EXPIRES_UTC IS NULL OR EXPIRES_UTC > :p{buckets.Count})
+            GROUP BY K
+            """, r => (Key: r.GetString(0), Count: r.GetInt64(1)), [.. buckets.Values, now])
+            .ToDictionary(row => row.Key, row => row.Count, StringComparer.Ordinal);
+        return buckets.ToDictionary(bucket => bucket.Key, bucket => counts.GetValueOrDefault(bucket.Value));
     });
 
     private sealed record MonitorRow(long Id, JobData Job, DateTime? ChangedAt, string? Reason, Dictionary<string, string> Data);

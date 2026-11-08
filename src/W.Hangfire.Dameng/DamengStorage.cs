@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Hangfire;
 using Hangfire.Server;
 using Hangfire.Storage;
@@ -42,25 +43,40 @@ public sealed class DamengStorage : JobStorage
 
     private sealed class ExpirationProcess(DamengStorage storage) : IBackgroundProcess
     {
+        private const int BatchSize = 200;
+        private const int MaxBatches = 8;
+        private static readonly TimeSpan CycleBudget = TimeSpan.FromSeconds(25);
+
         public void Execute(BackgroundProcessContext context)
         {
-            storage.Database.Write(session =>
+            var elapsed = Stopwatch.StartNew();
+            for (var batch = 0; batch < MaxBatches; batch++)
             {
-                var now = session.UtcNow();
-                foreach (var table in new[] { "WHF_JOB", "WHF_COUNTER" })
+                context.StoppingToken.ThrowIfCancellationRequested();
+                var fullBatch = storage.Database.Write(session =>
                 {
-                    session.Execute($"""
-                        DELETE FROM {table} WHERE ID IN (
-                            SELECT ID FROM {table} WHERE EXPIRES_UTC <= :p0 ORDER BY EXPIRES_UTC LIMIT 200)
+                    context.StoppingToken.ThrowIfCancellationRequested();
+                    var now = session.UtcNow();
+                    var jobs = DeleteExpiredRows(session, "WHF_JOB", now);
+                    var counters = DeleteExpiredRows(session, "WHF_COUNTER", now);
+                    var collections = session.Execute($"""
+                        DELETE FROM WHF_COLLECTION WHERE EXPIRES_UTC <= :p0 AND ROWNUM <= {BatchSize}
                         """, now);
-                }
+                    return jobs == BatchSize || counters == BatchSize || collections == BatchSize;
+                });
 
-                session.Execute("""
-                    DELETE FROM WHF_COLLECTION WHERE EXPIRES_UTC <= :p0 AND ROWNUM <= 200
-                    """, now);
-            });
+                // The transaction and WRITER lock have been released before starting the next batch.
+                if (!fullBatch || elapsed.Elapsed >= CycleBudget) break;
+            }
+
             context.Wait(storage.Options.ExpirationCheckInterval);
         }
+
+        private static int DeleteExpiredRows(SqlSession session, string table, DateTime now) => session.Execute($"""
+            DELETE FROM {table} WHERE ID IN (
+                SELECT ID FROM {table} WHERE EXPIRES_UTC <= :p0 ORDER BY EXPIRES_UTC, ID LIMIT {BatchSize})
+            """, now);
+
     }
 }
 

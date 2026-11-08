@@ -51,8 +51,7 @@ public sealed partial class StorageTests
         using (seed.AcquireDistributedLock(resource, TimeSpan.FromSeconds(10))) { }
 
         // Emulate the two physical sessions of an owner after its final lock check.
-        using var lockSession = new DmConnection(ConnectionString());
-        lockSession.Open();
+        using var lockSession = OpenVerified();
         using var lockTransaction = lockSession.BeginTransaction(IsolationLevel.ReadCommitted, false);
         using (var command = lockSession.CreateCommand("SELECT K FROM WHF_LOCK WHERE K = :p0 FOR UPDATE"))
         {
@@ -61,8 +60,7 @@ public sealed partial class StorageTests
             Assert.Equal(key, command.ExecuteScalar());
         }
 
-        using var writer = new DmConnection(ConnectionString());
-        writer.Open();
+        using var writer = OpenVerified();
         using var writeTransaction = writer.BeginTransaction(IsolationLevel.ReadCommitted, false);
         using (var command = writer.CreateCommand("SELECT K FROM WHF_LOCK WHERE K = 'WRITER' FOR UPDATE"))
         {
