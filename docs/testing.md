@@ -1,6 +1,6 @@
 # 构建、包验证与实库复跑
 
-在仓库根目录执行。SDK 版本由 `global.json` 固定为 10.0.401。脚本设置可写的任务级 `DOTNET_CLI_HOME`、关闭首次体验与遥测，并采用单节点、禁用节点复用和共享编译的参数。不要为恢复失败清空全局 NuGet 缓存。
+在仓库根目录执行。需要 Git 和 Python 3.9+；SDK 版本由 `global.json` 固定为 10.0.401。脚本设置可写的任务级 `DOTNET_CLI_HOME`、关闭首次体验与遥测，并采用单节点、禁用节点复用和共享编译的参数。不要为恢复失败清空全局 NuGet 缓存。
 
 ## 不需要数据库的检查
 
@@ -9,7 +9,7 @@ scripts/build.sh
 scripts/verify-packages.sh --negative-checks
 ```
 
-第一条只构建解决方案。第二条运行验证器策略测试、构建解决方案和六个 provisioner、生成四个 NuGet 包，并在仓库外创建仅依赖包的消费者。它不会运行 provisioner 或连接数据库。报告和产物位于 `artifacts/package-validation/<run-id>/`，详细机制见 [包验证说明](package-validation.md)。
+第一条先重建三个 TickerQ 补丁依赖包，再构建解决方案。第二条运行验证器策略测试、重建补丁、构建解决方案和六个 provisioner、生成四个适配包并收集三个补丁包，并在仓库外创建仅依赖包的消费者。它不会运行 provisioner 或连接数据库。报告和产物位于 `artifacts/package-validation/<run-id>/`，详细机制见 [包验证说明](package-validation.md)。
 
 网络受限而本机已有外部依赖缓存时，可显式设置 `NUGET_PACKAGES` 指向该缓存目录。包验证脚本默认保留用户的外部依赖缓存，并为消费检查创建独立缓存。不要用旧适配包覆盖本次产物，也不要把网络错误算成反向检查通过。
 
@@ -28,7 +28,8 @@ scripts/verify-packages.sh --negative-checks
 scripts/flexlabs/run.sh provision
 scripts/flexlabs/run.sh test -c Release
 
-# TickerQ
+# TickerQ：先构建补丁，再创建隔离资源
+scripts/tickerq/build-f14.sh
 scripts/tickerq/run.sh provision -c Release
 scripts/tickerq/run.sh test -c Release
 
@@ -55,12 +56,12 @@ scripts/namingconventions/run.sh test -c Release
 
 ```sh
 scripts/tickerq/run.sh test -c Release \
-  --filter 'FullyQualifiedName~Native_queue_accepts_both_claims' \
+  --filter 'FullyQualifiedName~Fenced_queue_rejects_second_claim_when_UpdatedAt_does_not_advance' \
   --logger 'trx;LogFileName=tickerq-clock.trx' \
   --results-directory artifacts/local-tests/tickerq
 ```
 
-该例是**已知缺陷刻画**：测试通过表示复现了重复领取，不表示问题已修复。只有已完成依赖恢复且源码配置一致时才使用 `--no-restore`。
+该例筛选领取令牌回归；原版缺陷刻画和旧库迁移验证使用独立入口，步骤见 [TickerQ 实库验证](tickerq.md#实库验证)。只有已完成依赖恢复且源码配置一致时才使用 `--no-restore`。
 
 ## 结果与恢复
 
@@ -70,4 +71,4 @@ scripts/tickerq/run.sh test -c Release \
 
 建库中断时保留原归属回执，核对精确对象后按相应入口的恢复规则处理。Hangfire 支持对已记录的数据文件和原始凭据进行恢复核验；旧的不完整回执缺少数据文件信息时会停止。FlexLabs 夹具留下的 `.pending.json` 表示 CREATE 结果需要核实，`.created.json` 表示已确认创建。不得按宽泛名称前缀删除未知归属对象。
 
-本轮执行结果、重跑历史与未解决问题见 [2026-11-08 汇总](review-remediation-2026-11-08.md)。
+首轮结果与重跑历史见 [2026-11-08 汇总](review-remediation-2026-11-08.md)，后续结果见 [F13/F14 修复验收](f13-f14-resolution-2026-11-08.md)。

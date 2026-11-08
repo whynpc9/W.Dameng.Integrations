@@ -9,6 +9,10 @@ namespace PackageValidation;
 
 public static class AllLibraries
 {
+    // This member exists only in the fenced runtime; an upstream assembly cannot satisfy it.
+    public static Guid ReadClaimToken(global::TickerQ.Utilities.Entities.TimeTickerEntity ticker)
+        => ticker.ClaimToken;
+
     // Compiled only: validation never invokes these methods or opens a database.
     public static void Configure(IServiceCollection services, DbContextOptionsBuilder options, string connection)
     {

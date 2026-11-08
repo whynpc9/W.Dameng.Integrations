@@ -9,8 +9,8 @@ def baseline():
         "W.DamengProvider": "0.3.1", "Hangfire.Core": "1.8.23", "Newtonsoft.Json": "13.0.3",
         "Microsoft.EntityFrameworkCore": "10.0.12", "Microsoft.EntityFrameworkCore.Relational": "10.0.12",
         "W.EntityFrameworkCore.Dameng": "0.5.0", "W.EntityFrameworkCore.Dameng.WDriver": "0.5.0-preview.1",
-        "FlexLabs.EntityFrameworkCore.Upsert": "10.1.0", "TickerQ": "10.1.1",
-        "TickerQ.Utilities": "10.1.1", "TickerQ.EntityFrameworkCore": "10.1.1",
+        "FlexLabs.EntityFrameworkCore.Upsert": "10.1.0", "W.TickerQ.Core": "10.1.1-dameng.1",
+        "W.TickerQ.Utilities": "10.1.1-dameng.1", "W.TickerQ.EntityFrameworkCore": "10.1.1-dameng.1",
         "OpenIddict.EntityFrameworkCore": "6.3.0",
     }
     return {name: (version, {"type": "package"}) for name, version in versions.items()}
@@ -21,11 +21,19 @@ class DependencyPolicyTests(unittest.TestCase):
         check_dependencies(baseline(), True)
 
     def test_tickerq_direct_dependencies_cannot_drift(self):
-        for name in ("TickerQ", "TickerQ.Utilities", "TickerQ.EntityFrameworkCore"):
+        for name in ("W.TickerQ.Core", "W.TickerQ.Utilities", "W.TickerQ.EntityFrameworkCore"):
             with self.subTest(name=name):
                 resolved = baseline()
                 resolved[name] = ("10.1.2", {"type": "package"})
                 with self.assertRaisesRegex(ValidationError, name):
+                    check_dependencies(resolved, True)
+
+    def test_unpatched_tickerq_mix_is_rejected(self):
+        for name in ("TickerQ", "TickerQ.Utilities", "TickerQ.EntityFrameworkCore"):
+            with self.subTest(name=name):
+                resolved = baseline()
+                resolved[name] = ("10.1.1", {"type": "package"})
+                with self.assertRaisesRegex(ValidationError, "Unpatched TickerQ"):
                     check_dependencies(resolved, True)
 
     def test_missing_required_dependency_is_not_accepted(self):
