@@ -23,6 +23,14 @@ Npgsql、Pomelo 等其他数据库提供程序不做达梦适配。UniWeb 接入
 scripts/build.sh
 ```
 
+无需数据库的完整包验证（包括六个 provisioner 编译及正反向独立消费检查）：
+
+```sh
+scripts/verify-packages.sh --negative-checks
+```
+
+详见[包验证入口](docs/package-validation.md)。
+
 实库测试需要先使用各集成的 `provision` 入口创建独立用户/schema 和表空间，再运行测试。授权的本地管理员配置路径及隔离规则见 [AGENTS.md](AGENTS.md)。每个入口会保存自己的忽略配置，重复 provision 验证已有分配，不复用来源文件中的原测试 schema。
 
 ```sh
