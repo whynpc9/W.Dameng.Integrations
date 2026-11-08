@@ -165,6 +165,84 @@ public sealed class OperationalStoreTests
         });
 
     [Fact]
+    public Task Native_queue_accepts_both_claims_when_UpdatedAt_does_not_advance()
+        => LiveDatabase.RunAsync(async database =>
+        {
+            using var first = database.CreateNode("equal-a", new FixedClock(Epoch));
+            using var second = database.CreateNode("equal-b", new FixedClock(Epoch));
+            var ticker = await AddTimeAsync(first, Epoch.AddSeconds(1));
+            var snapshotA = Assert.Single(await Store(first).GetEarliestTimeTickers());
+            var snapshotB = Assert.Single(await Store(second).GetEarliestTimeTickers());
+            Assert.Equal(ticker.Id, snapshotA.Id);
+            Assert.Equal(ticker.Id, snapshotB.Id);
+            Assert.Equal(Epoch.Ticks, snapshotA.UpdatedAt.Ticks);
+            Assert.Equal(Epoch.Ticks, snapshotB.UpdatedAt.Ticks);
+
+            // Both snapshots precede either write. Complete A first to make the stale claim deterministic.
+            var firstClaim = Assert.Single(await CollectAsync(Store(first).QueueTimeTickers([snapshotA])));
+            Assert.Equal(ticker.Id, firstClaim.Id);
+            Assert.Equal("equal-a", firstClaim.LockHolder);
+            await AssertTimeClaimAsync(database, ticker.Id, "equal-a", TickerStatus.Queued, Epoch);
+
+            var secondClaim = Assert.Single(await CollectAsync(Store(second).QueueTimeTickers([snapshotB])));
+            Assert.Equal(ticker.Id, secondClaim.Id);
+            Assert.Equal("equal-b", secondClaim.LockHolder);
+            await AssertTimeClaimAsync(database, ticker.Id, "equal-b", TickerStatus.Queued, Epoch);
+        });
+
+    [Fact]
+    public Task Native_timeout_queue_accepts_both_claims_when_UpdatedAt_moves_backwards()
+        => LiveDatabase.RunAsync(async database =>
+        {
+            var gate = new TimeTickerUpdateGate();
+            var firstTime = Epoch.AddTicks(-1);
+            var secondTime = Epoch.AddTicks(-2);
+            using var setup = database.CreateNode("rollback-setup", new FixedClock(Epoch));
+            using var first = database.CreateNode("rollback-a", new FixedClock(firstTime));
+            using var second = database.CreateNode("rollback-b", new FixedClock(secondTime), interceptor: gate);
+            var ticker = await AddTimeAsync(setup, Epoch.AddMinutes(-1));
+            var initial = await ReadJobAsync(database, "TimeTickers", ticker.Id);
+            Assert.Equal(TickerStatus.Idle, initial.Status);
+            Assert.Equal(Epoch.Ticks, initial.UpdatedAt.Ticks);
+
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            var secondClaims = CollectAsync(Store(second).QueueTimedOutTimeTickers(deadline.Token));
+            try
+            {
+                // B has read its eligible snapshot but has not sent the UPDATE to Dameng.
+                var ready = await Task.WhenAny(gate.Entered, secondClaims).WaitAsync(deadline.Token);
+                if (ready == secondClaims)
+                    await secondClaims;
+                Assert.Same(gate.Entered, ready);
+
+                var firstClaim = Assert.Single(await CollectAsync(Store(first).QueueTimedOutTimeTickers(deadline.Token)));
+                Assert.Equal(ticker.Id, firstClaim.Id);
+                Assert.Equal(Epoch.Ticks, firstClaim.UpdatedAt.Ticks);
+                await AssertTimeClaimAsync(database, ticker.Id, "rollback-a", TickerStatus.InProgress, firstTime);
+            }
+            finally
+            {
+                gate.Release();
+                await secondClaims;
+            }
+
+            var secondClaim = Assert.Single(await secondClaims);
+            Assert.Equal(ticker.Id, secondClaim.Id);
+            Assert.Equal(Epoch.Ticks, secondClaim.UpdatedAt.Ticks);
+            await AssertTimeClaimAsync(database, ticker.Id, "rollback-b", TickerStatus.InProgress, secondTime);
+        });
+
+    private static async Task AssertTimeClaimAsync(
+        LiveDatabase database, Guid id, string owner, TickerStatus status, DateTime timestamp)
+    {
+        var row = await ReadJobAsync(database, "TimeTickers", id);
+        Assert.Equal(owner, row.Owner);
+        Assert.Equal(status, row.Status);
+        Assert.Equal(timestamp.Ticks, row.UpdatedAt.Ticks);
+        Assert.Equal(timestamp.Ticks, row.LockedAt?.Ticks);
+    }
+
+    [Fact]
     public Task Restart_recovers_its_time_and_cron_jobs_and_persists_both_failures_after_retry()
         => LiveDatabase.RunAsync(async database =>
         {
@@ -244,14 +322,15 @@ public sealed class OperationalStoreTests
 
     private static Task<JobRow> ReadJobAsync(LiveDatabase database, string table, Guid id)
         => database.QueryAsync($"""
-            SELECT "Status", "LockHolder", "UpdatedAt", "RetryCount", "ExecutedAt", "ExceptionMessage"
+            SELECT "Status", "LockHolder", "UpdatedAt", "RetryCount", "ExecutedAt", "ExceptionMessage", "LockedAt"
             FROM "{table}" WHERE "Id" = :id
             """, async reader =>
         {
             Assert.True(await reader.ReadAsync(), "Expected job was not found by independent SQL.");
             var row = new JobRow((TickerStatus)reader.GetInt32(0), reader.IsDBNull(1) ? null : reader.GetString(1),
                 reader.GetDateTime(2), reader.GetInt32(3), reader.IsDBNull(4) ? null : reader.GetDateTime(4),
-                reader.IsDBNull(5) ? null : reader.GetString(5));
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetDateTime(6));
             Assert.False(await reader.ReadAsync());
             return row;
         }, id);
@@ -342,5 +421,5 @@ public sealed class OperationalStoreTests
     }
 
     private sealed record FixedClock(DateTime UtcNow) : ITickerClock;
-    private sealed record JobRow(TickerStatus Status, string? Owner, DateTime UpdatedAt, int RetryCount, DateTime? ExecutedAt, string? Exception);
+    private sealed record JobRow(TickerStatus Status, string? Owner, DateTime UpdatedAt, int RetryCount, DateTime? ExecutedAt, string? Exception, DateTime? LockedAt);
 }

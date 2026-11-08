@@ -69,4 +69,21 @@ scripts/tickerq/run.sh test
 
 测试从原生 manager/provider 写入，并通过另一个连接直接执行 SQL 读回。双节点竞争采用独立 host 与连接，重启用例销毁旧 host 后以相同 ID 启动新 host，由 TickerQ 的原生启动回调和后台调度恢复任务。该测试边界是共享数据库的多个调度 host，未覆盖跨机进程终止、Redis 和 Dashboard。
 
-Release 实库验收为 **5 通过，0 失败，0 跳过**。初始迁移创建的三张表均位于独立表空间。两个节点竞争同一周期实例时只有一个入队成功，直接调用 `NoUpdate()` 得到插入 1 行、重复键 0 行。时间任务竞争保留并验证了相差 1 tick 的 `UpdatedAt`。96,002 字节请求与 48,004 个 UTF-16 代码单元的异常消息均按原值读回。重启后，时间任务和周期实例各执行两次，最终持久化为 `Failed`，另一节点的进行中任务仍保留原锁。
+初始适配的 Release 实库验收为 **5 通过，0 失败，0 跳过**。初始迁移创建的三张表均位于独立表空间。两个节点竞争同一周期实例时只有一个入队成功，直接调用 `NoUpdate()` 得到插入 1 行、重复键 0 行。时间任务竞争保留并验证了相差 1 tick 的 `UpdatedAt`。96,002 字节请求与 48,004 个 UTF-16 代码单元的异常消息均按原值读回。重启后，时间任务和周期实例各执行两次，最终持久化为 `Failed`，另一节点的进行中任务仍保留原锁。
+
+## 时间任务抢占的时钟边界
+
+TickerQ 10.1.1 的原生 provider 在以下两种时序中会向两个节点各返回一次同一时间任务。两个节点都先取得写入前的快照，第二次更新在第一次提交后执行。达梦通过独立连接读回每次更新后的 owner、status、`UpdatedAt` 和 `LockedAt`。
+
+| 原生路径 | 实库结果 |
+| --- | --- |
+| `QueueTimeTickers`，固定时钟等于快照的 `UpdatedAt` | A 和 B 各领取 1 次。每次均写入 `Queued`，时间戳保持不变，owner 从 A 改为 B。 |
+| `QueueTimedOutTimeTickers`，两节点时钟分别比快照早 1 tick 和 2 tick | A 和 B 各领取 1 次。每次均写入 `InProgress`，时间戳随节点时钟回退，owner 从 A 改为 B。 |
+
+这是重复领取证据。测试直接枚举 provider 的返回值，未启动调度器执行这两项任务。原生更新在常规路径比较 `UpdatedAt == snapshot`，超时路径比较 `UpdatedAt <= snapshot`。两条路径在更新时均写入节点时钟，且没有重新检查任务状态或 owner。达梦 `TIMESTAMP(7)` 读回了完整的 100 ns tick，因此提高列精度无法使旧快照失效。[TickerQ 10.1.1 原生实现](https://github.com/Arcenox-co/TickerQ/blob/b2684f41a1c22f09e05cbac087c117751bd3e78c/src/TickerQ.EntityFrameworkCore/Infrastructure/BasePersistenceProvider.cs#L35-L99)
+
+本适配继续使用原生 provider，运行时行为保持上述边界。节点各自使用单调时钟无法保证写入值严格大于另一节点已读到的值。数据库触发器如果单独改写时间戳，常规路径返回给调度器的 `UpdatedAt` 仍为原生代码写回的时钟值，与数据库状态不一致。原生实现类为 internal，两条领取方法均没有可覆盖的扩展点。修复需要介入原子领取条件或并发令牌协议，并重新验证旧 `Queued` 任务的超时接管、同节点重启恢复和返回对象与数据库状态的一致性。本轮尚无通过这些验证的局部修复或可确认的升级版本。升级验收要求候选版本在两种时序下均只产生一个赢家，并保留超时与重启恢复行为。
+
+已发布的 10.5.1 是后续验证候选。其 EF 存储升级涉及运行分区和表结构迁移。另查到上游开发提交 `2ac18b3` 在持久化协议中使用获取令牌，但源码证据无法代替该发布包的达梦领取和迁移实测。[10.5.1 NuGet](https://www.nuget.org/packages/TickerQ.EntityFrameworkCore/10.5.1) · [存储升级说明](https://tickerq.net/docs/5.x/guides/storage-upgrade) · [上游开发提交的 EF provider](https://github.com/Arcenox-co/TickerQ/blob/2ac18b3b38150e52c1bdb5581a43b98aa569b73d/src/TickerQ.EntityFrameworkCore/Infrastructure/BasePersistenceProvider.cs)
+
+F14 的 Release 定向测试为 **2 通过，0 失败，0 跳过**。最终全套为 **7 通过，0 失败，0 跳过**。其中新增两项的通过表示成功复现并读回重复领取。前两轮全套分别为 5 通过、2 失败和 6 通过、1 失败，均无跳过。三个失败均为既有用例遇到的 WDriver 超时，最终原样重跑通过。
