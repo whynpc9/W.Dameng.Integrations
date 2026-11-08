@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using TickerQ.Utilities;
 using TickerQ.Utilities.Entities;
 using TickerQ.Utilities.Interfaces;
 using W.Dm;
@@ -14,16 +15,19 @@ namespace W.TickerQ.Dameng.Tests;
 
 internal sealed class LiveDatabase(Isolation isolation)
 {
-    internal static async Task RunAsync(Func<LiveDatabase, Task> test)
+    internal static async Task RunAsync(Func<LiveDatabase, Task> test, bool reset = true)
     {
         var phase = "open isolated test database";
         try
         {
-            var root = new DirectoryInfo(AppContext.BaseDirectory);
-            while (!File.Exists(Path.Combine(root.FullName, "scripts", "tickerq", "run.sh")))
-                root = root.Parent ?? throw new InvalidOperationException("Worktree not found.");
+            var root = FindWorktree();
 
-            var path = Path.Combine(root.FullName, ".local", "tickerq");
+#if TICKERQ_F14 || TICKERQ_F14_SEED
+            const string lane = "tickerq-f14";
+#else
+            const string lane = "tickerq";
+#endif
+            var path = Path.Combine(root.FullName, ".local", lane);
             using var gate = new FileStream(Path.Combine(path, "test.lock"), FileMode.OpenOrCreate,
                 FileAccess.ReadWrite, FileShare.None);
             var isolation = Isolation.Read(Path.Combine(path, "isolation.json"), requireReady: true);
@@ -35,9 +39,12 @@ internal sealed class LiveDatabase(Isolation isolation)
             await using var context = await host.Services
                 .GetRequiredService<IDbContextFactory<DamengTickerQDbContext>>().CreateDbContextAsync();
             await context.Database.MigrateAsync();
-            await context.Set<CronTickerOccurrenceEntity<CronTickerEntity>>().ExecuteDeleteAsync();
-            await context.Set<TimeTickerEntity>().ExecuteDeleteAsync();
-            await context.Set<CronTickerEntity>().ExecuteDeleteAsync();
+            if (reset)
+            {
+                await context.Set<CronTickerOccurrenceEntity<CronTickerEntity>>().ExecuteDeleteAsync();
+                await context.Set<TimeTickerEntity>().ExecuteDeleteAsync();
+                await context.Set<CronTickerEntity>().ExecuteDeleteAsync();
+            }
 
             phase = "exercise TickerQ";
             await test(database);
@@ -46,12 +53,24 @@ internal sealed class LiveDatabase(Isolation isolation)
         {
             var site = new StackTrace(error, fNeedFileInfo: true).GetFrames()
                 .FirstOrDefault(frame => frame.GetFileName()?.Contains("W.TickerQ.Dameng.Tests", StringComparison.Ordinal) == true);
-            throw new XunitException($"{phase}: {Isolation.Failure(error)} at {site?.GetMethod()?.Name}:{site?.GetFileLineNumber()}");
+            var origin = error.GetBaseException().TargetSite;
+            throw new XunitException(
+                $"{phase}: {Isolation.Failure(error)} at {site?.GetMethod()?.Name}:{site?.GetFileLineNumber()} "
+                + $"({origin?.DeclaringType?.Name}.{origin?.Name})");
         }
     }
 
+    internal static DirectoryInfo FindWorktree()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (!File.Exists(Path.Combine(root.FullName, "scripts", "tickerq", "run.sh")))
+            root = root.Parent ?? throw new InvalidOperationException("Worktree not found.");
+        return root;
+    }
+
     internal IHost CreateNode(string node, ITickerClock? clock = null, bool runScheduler = false,
-        DbCommandInterceptor? interceptor = null)
+        DbCommandInterceptor? interceptor = null,
+        Action<TickerOptionsBuilder<TimeTickerEntity, CronTickerEntity>>? configure = null)
     {
         var builder = Host.CreateApplicationBuilder();
         builder.Logging.ClearProviders();
@@ -66,6 +85,7 @@ internal sealed class LiveDatabase(Isolation isolation)
                 scheduler.NodeIdentifier = node;
                 scheduler.FallbackIntervalChecker = TimeSpan.FromMilliseconds(100);
             });
+            configure?.Invoke(options);
         }, typeof(LiveDatabase).Assembly.GetName().Name);
 
         if (clock is not null)

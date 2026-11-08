@@ -140,6 +140,18 @@ namespace W.TickerQ.Dameng.Tests.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("CHAR(36)");
 
+#if TICKERQ_F14
+                    b.Property<bool>("ClaimStarted")
+                        .IsConcurrencyToken()
+                        .HasColumnType("BIT")
+                        .HasDefaultValue(false);
+
+                    b.Property<Guid>("ClaimToken")
+                        .IsConcurrencyToken()
+                        .HasColumnType("CHAR(36)")
+                        .HasDefaultValue(new Guid("00000000-0000-0000-0000-000000000000"));
+
+#endif
                     b.Property<DateTime>("CreatedAt")
                         .HasPrecision(7)
                         .HasColumnType("TIMESTAMP(7)");
@@ -197,6 +209,9 @@ namespace W.TickerQ.Dameng.Tests.Migrations
                         .HasColumnType("NCLOB");
 
                     b.Property<int>("Status")
+#if TICKERQ_F14
+                        .IsConcurrencyToken()
+#endif
                         .HasColumnType("INT");
 
                     b.Property<DateTime>("UpdatedAt")

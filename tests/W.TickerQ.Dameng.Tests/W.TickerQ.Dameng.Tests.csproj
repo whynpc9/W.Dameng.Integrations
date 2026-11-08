@@ -1,7 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
+    <TickerQF14 Condition="'$(TickerQF14)' == ''">true</TickerQF14>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TickerQF14)' == 'true'">
+    <DefineConstants>$(DefineConstants);TICKERQ_F14</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TickerQF14Seed)' == 'true'">
+    <DefineConstants>$(DefineConstants);TICKERQ_F14_SEED</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TickerQF14Migration)' == 'true'">
+    <DefineConstants>$(DefineConstants);TICKERQ_F14_MIGRATION</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/W.TickerQ.Dameng/W.TickerQ.Dameng.csproj" />

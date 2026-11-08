@@ -14,7 +14,7 @@ using Xunit;
 
 namespace W.TickerQ.Dameng.Tests;
 
-public sealed class OperationalStoreTests
+public sealed partial class OperationalStoreTests
 {
     private const string Function = "DamengAcceptance";
     private const string Cron = "0 0 0 1 1 *";
@@ -32,7 +32,10 @@ public sealed class OperationalStoreTests
     private static void RegisterJob()
         => TickerFunctionProvider.RegisterFunctions(new Dictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate)>
         {
-            [Function] = (string.Empty, TickerTaskPriority.Normal, FailJobAsync)
+            [Function] = (string.Empty, TickerTaskPriority.Normal, FailJobAsync),
+#if TICKERQ_F14
+            [StartupFunction] = (string.Empty, TickerTaskPriority.Normal, HoldStartupJobAsync),
+#endif
         });
 
     [Fact]
@@ -42,7 +45,11 @@ public sealed class OperationalStoreTests
             using var node = database.CreateNode("migration");
             await using var context = await ContextAsync(node);
             Assert.False(context.Database.HasPendingModelChanges());
+#if TICKERQ_F14
+            Assert.Equal(2, (await context.Database.GetAppliedMigrationsAsync()).Count());
+#else
             Assert.Single(await context.Database.GetAppliedMigrationsAsync());
+#endif
             Assert.Empty(await context.Database.GetPendingMigrationsAsync());
             var tablespaces = await database.QueryAsync("""
                 SELECT TABLESPACE_NAME FROM USER_TABLES
@@ -165,7 +172,11 @@ public sealed class OperationalStoreTests
         });
 
     [Fact]
+#if TICKERQ_F14
+    public Task Fenced_queue_rejects_second_claim_when_UpdatedAt_does_not_advance()
+#else
     public Task Native_queue_accepts_both_claims_when_UpdatedAt_does_not_advance()
+#endif
         => LiveDatabase.RunAsync(async database =>
         {
             using var first = database.CreateNode("equal-a", new FixedClock(Epoch));
@@ -184,14 +195,30 @@ public sealed class OperationalStoreTests
             Assert.Equal("equal-a", firstClaim.LockHolder);
             await AssertTimeClaimAsync(database, ticker.Id, "equal-a", TickerStatus.Queued, Epoch);
 
+#if TICKERQ_F14
+            Assert.NotEqual(Guid.Empty, firstClaim.ClaimToken);
+            Assert.Empty(await CollectAsync(Store(second).QueueTimeTickers([snapshotB])));
+            await AssertTimeClaimAsync(database, ticker.Id, "equal-a", TickerStatus.Queued, Epoch);
+            Assert.Equal(firstClaim.ClaimToken, (await Store(second).GetTimeTickerById(ticker.Id)).ClaimToken);
+
+            Assert.Equal(1, await Store(first).RemoveTimeTickers([ticker.Id]));
+            var recreated = await AddTimeAsync(first, Epoch.AddSeconds(1), id: ticker.Id);
+            Assert.NotEqual(snapshotB.ClaimToken, recreated.ClaimToken);
+            Assert.Empty(await CollectAsync(Store(second).QueueTimeTickers([snapshotB])));
+#else
             var secondClaim = Assert.Single(await CollectAsync(Store(second).QueueTimeTickers([snapshotB])));
             Assert.Equal(ticker.Id, secondClaim.Id);
             Assert.Equal("equal-b", secondClaim.LockHolder);
             await AssertTimeClaimAsync(database, ticker.Id, "equal-b", TickerStatus.Queued, Epoch);
+#endif
         });
 
     [Fact]
+#if TICKERQ_F14
+    public Task Fenced_timeout_rejects_second_claim_when_UpdatedAt_moves_backwards()
+#else
     public Task Native_timeout_queue_accepts_both_claims_when_UpdatedAt_moves_backwards()
+#endif
         => LiveDatabase.RunAsync(async database =>
         {
             var gate = new TimeTickerUpdateGate();
@@ -217,7 +244,13 @@ public sealed class OperationalStoreTests
 
                 var firstClaim = Assert.Single(await CollectAsync(Store(first).QueueTimedOutTimeTickers(deadline.Token)));
                 Assert.Equal(ticker.Id, firstClaim.Id);
+#if TICKERQ_F14
+                Assert.Equal(firstTime.Ticks, firstClaim.UpdatedAt.Ticks);
+                Assert.NotEqual(Guid.Empty, firstClaim.ClaimToken);
+                Assert.Equal("rollback-a", firstClaim.LockHolder);
+#else
                 Assert.Equal(Epoch.Ticks, firstClaim.UpdatedAt.Ticks);
+#endif
                 await AssertTimeClaimAsync(database, ticker.Id, "rollback-a", TickerStatus.InProgress, firstTime);
             }
             finally
@@ -226,10 +259,15 @@ public sealed class OperationalStoreTests
                 await secondClaims;
             }
 
+#if TICKERQ_F14
+            Assert.Empty(await secondClaims);
+            await AssertTimeClaimAsync(database, ticker.Id, "rollback-a", TickerStatus.InProgress, firstTime);
+#else
             var secondClaim = Assert.Single(await secondClaims);
             Assert.Equal(ticker.Id, secondClaim.Id);
             Assert.Equal(Epoch.Ticks, secondClaim.UpdatedAt.Ticks);
             await AssertTimeClaimAsync(database, ticker.Id, "rollback-b", TickerStatus.InProgress, secondTime);
+#endif
         });
 
     private static async Task AssertTimeClaimAsync(
@@ -348,11 +386,13 @@ public sealed class OperationalStoreTests
             return true;
         }, id);
 
-    private static async Task<TimeTickerEntity> AddTimeAsync(IHost node, DateTime executionTime, int[]? intervals = null, int retries = 0)
+    private static async Task<TimeTickerEntity> AddTimeAsync(IHost node, DateTime executionTime, int[]? intervals = null,
+        int retries = 0, Guid? id = null)
     {
         var manager = node.Services.GetRequiredService<ITimeTickerManager<TimeTickerEntity>>();
         return RequireSuccess(await manager.AddAsync(new TimeTickerEntity
         {
+            Id = id ?? Guid.NewGuid(),
             Function = Function,
             ExecutionTime = executionTime,
             Retries = retries,
@@ -361,11 +401,12 @@ public sealed class OperationalStoreTests
         }));
     }
 
-    private static async Task<CronTickerEntity> AddCronAsync(IHost node, int[]? intervals, int retries = 0)
+    private static async Task<CronTickerEntity> AddCronAsync(IHost node, int[]? intervals, int retries = 0, Guid? id = null)
     {
         var manager = node.Services.GetRequiredService<ICronTickerManager<CronTickerEntity>>();
         return RequireSuccess(await manager.AddAsync(new CronTickerEntity
         {
+            Id = id ?? Guid.NewGuid(),
             Function = Function,
             Expression = Cron,
             Retries = retries,
