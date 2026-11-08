@@ -13,6 +13,15 @@ namespace W.FlexLabs.Upsert.Dameng;
 /// <summary>Executes FlexLabs upserts on the Dameng WDriver provider.</summary>
 public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
 {
+    private readonly ITable? _table;
+
+    public DamengUpsertCommandRunner() { }
+
+    // FlexLabs removes CLR types from KnownExpression. Keep the EF table mappings
+    // on a per-execution runner so the registered service keeps no mutable state.
+    private DamengUpsertCommandRunner(IEntityType entityType)
+        => _table = entityType.Model.GetRelationalModel().FindTable(entityType.GetTableName()!, entityType.GetSchema());
+
     public override bool Supports(string providerName) => providerName == "W.EntityFrameworkCore.Dameng.WDriver";
 
     protected override string EscapeName(string name) => "\"" + name.Replace("\"", "\"\"") + "\"";
@@ -70,7 +79,7 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
         if (updateExpressions is not null)
         {
             sql += " WHEN MATCHED THEN UPDATE SET " + string.Join(", ", updateExpressions.Select(
-                expression => "t." + EscapeName(expression.ColumnName) + " = " + ExpandValue(expression.Value)));
+                expression => ExpandAssignment(expression.ColumnName, expression.Value)));
             if (updateCondition is not null)
                 sql += " WHERE " + ExpandExpression(updateCondition);
         }
@@ -89,6 +98,22 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
 
         return sql;
     }
+
+    private string ExpandAssignment(string columnName, IKnownValue value)
+    {
+        if (GetColumnKind(columnName) == OperandKind.UnsupportedText && ContainsTextAddition(value))
+            throw new NotSupportedException("Dameng upsert cannot assign string concatenation to a converted string column.");
+
+        return "t." + EscapeName(columnName) + " = " + ExpandValue(value);
+    }
+
+    private bool ContainsTextAddition(IKnownValue? value)
+        => value is KnownExpression expression
+            && ((expression.ExpressionType == ExpressionType.Add
+                    && GetOperandKind(expression) is OperandKind.Text or OperandKind.LobText)
+                || ContainsTextAddition(expression.Value1)
+                || ContainsTextAddition(expression.Value2)
+                || ContainsTextAddition(expression.Value3));
 
     protected override string ExpandExpression(KnownExpression expression, Func<string, string>? expandLeftColumn = null)
     {
@@ -109,12 +134,75 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
 
         return expression.ExpressionType switch
         {
+            ExpressionType.Add => ExpandAddition(expression, expandLeftColumn),
             ExpressionType.And => Function("BITAND", expression, expandLeftColumn),
             ExpressionType.Or => Function("BITOR", expression, expandLeftColumn),
             ExpressionType.Modulo => Function("MOD", expression, expandLeftColumn),
             _ => base.ExpandExpression(expression, expandLeftColumn)
         };
     }
+
+    private string ExpandAddition(KnownExpression expression, Func<string, string>? expandLeftColumn)
+    {
+        var left = expression.Value1;
+        var right = expression.Value2!;
+        return Combine(GetOperandKind(left), GetOperandKind(right)) switch
+        {
+            OperandKind.Text => Concatenate(left, right, "''", expandLeftColumn),
+            OperandKind.LobText => Concatenate(left, right, "TO_CLOB('')", expandLeftColumn),
+            OperandKind.UnsupportedText => throw new NotSupportedException(
+                "Dameng upsert string addition requires two string operands without value converters."),
+            _ => base.ExpandExpression(expression, expandLeftColumn)
+        };
+    }
+
+    private string Concatenate(IKnownValue left, IKnownValue right, string empty,
+        Func<string, string>? expandLeftColumn)
+        => $"(COALESCE({ExpandValue(left, expandLeftColumn)}, {empty})"
+            + $" || COALESCE({ExpandValue(right, expandLeftColumn)}, {empty}))";
+
+#pragma warning disable EF1001 // FlexLabs 10.1.0 exposes column names only through this pinned expression API.
+    private OperandKind GetOperandKind(IKnownValue value)
+        => value switch
+        {
+            ConstantValue { Value: null } => OperandKind.Null,
+            ConstantValue { Value: string, ColumnProperty: var column } =>
+                GetColumnKind(column?.ColumnName, fallback: OperandKind.Text),
+            PropertyValue property => GetColumnKind(property.Column.ColumnName),
+            KnownExpression { ExpressionType: ExpressionType.Add or ExpressionType.Coalesce or ExpressionType.Conditional } expression
+                => Combine(GetOperandKind(expression.Value1), GetOperandKind(expression.Value2!)),
+            _ => OperandKind.Other
+        };
+
+#pragma warning restore EF1001
+
+    private OperandKind GetColumnKind(string? name, OperandKind fallback = OperandKind.Other)
+    {
+        var mappings = name is null ? null : _table?.FindColumn(name)?.PropertyMappings;
+        if (mappings is null || !mappings.Any(mapping => mapping.Property.ClrType == typeof(string)))
+            return fallback;
+
+        if (!mappings.All(mapping => mapping.Property.ClrType == typeof(string) && mapping.TypeMapping.Converter is null))
+            return OperandKind.UnsupportedText;
+        return mappings.Any(mapping => mapping.TypeMapping.StoreTypeNameBase.ToUpperInvariant()
+            is "CLOB" or "NCLOB" or "TEXT" or "NTEXT" or "LONGVARCHAR")
+            ? OperandKind.LobText
+            : OperandKind.Text;
+    }
+
+    private static OperandKind Combine(OperandKind left, OperandKind right)
+    {
+        if (left == OperandKind.Null)
+            return right;
+        if (right == OperandKind.Null || left == right)
+            return left;
+        if ((left == OperandKind.Text && right == OperandKind.LobText)
+            || (left == OperandKind.LobText && right == OperandKind.Text))
+            return OperandKind.LobText;
+        return OperandKind.UnsupportedText;
+    }
+
+    private enum OperandKind { Other, Null, Text, LobText, UnsupportedText }
 
     private string Function(string name, KnownExpression expression, Func<string, string>? expandLeftColumn)
         => name + "(" + ExpandValue(expression.Value1, expandLeftColumn)
@@ -138,7 +226,8 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
         try
         {
             database.ExecuteSqlRaw(LockTable(entityType));
-            var affected = base.Run(dbContext, entityType, entities, commandArgs);
+            var affected = new DamengUpsertCommandRunner(entityType)
+                .ExecuteMerge(dbContext, entityType, entities, commandArgs);
             if (savepoint is not null)
                 current!.ReleaseSavepoint(savepoint);
             owned?.Commit();
@@ -182,8 +271,8 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
         try
         {
             await database.ExecuteSqlRawAsync(LockTable(entityType), cancellationToken).ConfigureAwait(false);
-            var affected = await base.RunAsync(dbContext, entityType, entities, commandArgs, cancellationToken)
-                .ConfigureAwait(false);
+            var affected = await new DamengUpsertCommandRunner(entityType)
+                .ExecuteMergeAsync(dbContext, entityType, entities, commandArgs, cancellationToken).ConfigureAwait(false);
             if (savepoint is not null)
                 await current!.ReleaseSavepointAsync(savepoint, CancellationToken.None).ConfigureAwait(false);
             if (owned is not null)
@@ -207,6 +296,15 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
             throw;
         }
     }
+
+    private int ExecuteMerge<TEntity>(DbContext dbContext, IEntityType entityType,
+        ICollection<TEntity> entities, UpsertCommandArgs<TEntity> commandArgs) where TEntity : class
+        => base.Run(dbContext, entityType, entities, commandArgs);
+
+    private Task<int> ExecuteMergeAsync<TEntity>(DbContext dbContext, IEntityType entityType,
+        ICollection<TEntity> entities, UpsertCommandArgs<TEntity> commandArgs, CancellationToken cancellationToken)
+        where TEntity : class
+        => base.RunAsync(dbContext, entityType, entities, commandArgs, cancellationToken);
 
     private static string NewSavepointName() => "WUPSERT_" + Guid.NewGuid().ToString("N");
 

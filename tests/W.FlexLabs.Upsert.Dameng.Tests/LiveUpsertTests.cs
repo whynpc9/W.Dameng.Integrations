@@ -359,6 +359,186 @@ public sealed class LiveUpsertTests : IClassFixture<LiveDatabase>
         Assert.Equal(TickerStatus.Queued, stored.Status);
     }
 
+    [Fact]
+    public void Fixture_creation_failure_cleans_first_table_and_keeps_original_error()
+    {
+        string? first = null;
+        string? second = null;
+        var error = Assert.Throws<AggregateException>(() => new LiveDatabase((operation, table) =>
+        {
+            if (operation != FixtureDdl.Create)
+                return;
+            if (first is null)
+            {
+                first = table;
+                return;
+            }
+
+            Assert.True(_database.TableExists(first));
+            second = table;
+            throw new IOException("Synthetic second CREATE failure.");
+        }));
+
+        Assert.Contains(nameof(IOException), Assert.Single(error.InnerExceptions).Message);
+        Assert.NotNull(first);
+        Assert.NotNull(second);
+        Assert.False(_database.TableExists(first));
+        Assert.False(_database.TableExists(second));
+        Assert.False(_database.HasOwnershipReceipt(first));
+        Assert.True(_database.TableExists(_database.MainTableName));
+    }
+
+    [Fact]
+    public void Fixture_drop_failure_does_not_skip_other_table_and_leaves_receipt_for_retry()
+    {
+        string? failedTable = null;
+        using var fixture = new LiveDatabase((operation, table) =>
+        {
+            if (operation == FixtureDdl.Drop && failedTable is null)
+            {
+                failedTable = table;
+                throw new IOException("Synthetic first DROP failure.");
+            }
+        });
+
+        var error = Assert.Throws<AggregateException>(fixture.Dispose);
+        Assert.Contains(nameof(IOException), Assert.Single(error.InnerExceptions).Message);
+        Assert.NotNull(failedTable);
+        Assert.NotEqual(fixture.MainTableName, failedTable);
+        Assert.False(_database.TableExists(fixture.MainTableName));
+        Assert.False(_database.HasOwnershipReceipt(fixture.MainTableName));
+        Assert.True(_database.TableExists(failedTable));
+        Assert.True(_database.HasOwnershipReceipt(failedTable));
+        Assert.True(_database.TableExists(_database.MainTableName));
+
+        fixture.Dispose();
+        Assert.False(_database.TableExists(failedTable));
+        Assert.False(_database.HasOwnershipReceipt(failedTable));
+        Assert.True(_database.TableExists(_database.MainTableName));
+    }
+
+    [Theory]
+    [InlineData(1, "001", "02", "00102")]
+    [InlineData(2, null, "02", "02")]
+    [InlineData(3, "001", null, "001")]
+    [InlineData(4, null, null, "")]
+    public async Task String_fields_concatenate_and_numeric_fields_add(
+        int item, string? previous, string? incoming, string expected)
+    {
+        await using var context = _database.CreateContext();
+        var existing = NewRow(14, item, 7);
+        existing.Part = item;
+        existing.Payload = previous;
+        Assert.Equal(1, await context.Rows.Upsert(existing).NoUpdate().RunAsync());
+        var next = NewRow(14, item, 2);
+        next.Part = item;
+        next.Payload = incoming;
+
+        Assert.Equal(1, await context.Rows.Upsert(next)
+            .WhenMatched((stored, source) => new Item
+            {
+                Payload = stored.Payload + source.Payload,
+                Counter = stored.Counter + source.Counter
+            }).RunAsync());
+
+        await using var reader = _database.CreateContext();
+        var saved = await reader.Rows.SingleAsync(row => row.Id == existing.Id);
+        Assert.Equal(expected, saved.Payload);
+        Assert.Equal(9, saved.Counter);
+    }
+
+    [Fact]
+    public void String_constant_and_nested_concatenations_keep_expression_precedence()
+    {
+        using var context = _database.CreateContext();
+        var existing = NewRow(15, 1, 7);
+        existing.Payload = "达梦";
+        Assert.Equal(1, context.Rows.Upsert(existing).NoUpdate().Run());
+
+        var next = NewRow(15, 1, 2);
+        next.Payload = "03";
+        var separator = "'|";
+        Assert.Equal(1, context.Rows.Upsert(next)
+            .WhenMatched((stored, source) => new Item
+            {
+                Payload = (stored.Payload + separator) + ((source.Payload ?? "nil") + "09"),
+                Counter = stored.Counter + (source.Counter + 3)
+            }).UpdateIf((stored, source) => stored.Payload + source.Payload == "达梦03").Run());
+
+        using var reader = _database.CreateContext();
+        var saved = reader.Rows.Single(row => row.Id == existing.Id);
+        Assert.Equal("达梦'|0309", saved.Payload);
+        Assert.Equal(12, saved.Counter);
+    }
+
+    [Fact]
+    public async Task Large_string_concatenation_preserves_the_entire_clob()
+    {
+        await using var context = _database.CreateContext();
+        var existing = NewRow(16, 1, 0);
+        existing.LargePayload = new string('前', 12_000);
+        Assert.Equal(1, await context.Rows.Upsert(existing).NoUpdate().RunAsync());
+
+        var next = NewRow(16, 1, 0);
+        next.LargePayload = new string('后', 12_000);
+        Assert.Equal(1, await context.Rows.Upsert(next)
+            .WhenMatched((stored, source) => new Item { LargePayload = stored.LargePayload + source.LargePayload })
+            .RunAsync());
+
+        next.Payload = "终";
+        Assert.Equal(1, await context.Rows.Upsert(next)
+            .WhenMatched((stored, source) => new Item { LargePayload = stored.LargePayload + source.Payload })
+            .RunAsync());
+
+        await using var reader = _database.CreateContext();
+        var saved = await reader.Rows.SingleAsync(row => row.Id == existing.Id);
+        Assert.Equal(existing.LargePayload + next.LargePayload + next.Payload, saved.LargePayload);
+    }
+
+    [Fact]
+    public async Task String_addition_with_non_string_operand_is_rejected_without_writing()
+    {
+        await using var context = _database.CreateContext();
+        var existing = NewRow(17, 1, 7);
+        existing.Payload = "001";
+        Assert.Equal(1, await context.Rows.Upsert(existing).NoUpdate().RunAsync());
+
+        await Assert.ThrowsAsync<NotSupportedException>(() => context.Rows.Upsert(NewRow(17, 1, 2))
+            .WhenMatched((stored, source) => new Item { Payload = stored.Payload + (object)source.Counter })
+            .RunAsync());
+
+        await using var reader = _database.CreateContext();
+        Assert.Equal("001", (await reader.Rows.SingleAsync(row => row.Id == existing.Id)).Payload);
+    }
+
+    [Fact]
+    public async Task String_concatenation_rejects_converted_operands_and_destinations()
+    {
+        await using var context = _database.CreateContext();
+        var existing = NewRow(18, 1, 7);
+        existing.Payload = "001";
+        existing.EncodedPayload = "existing";
+        Assert.Equal(1, await context.Rows.Upsert(existing).NoUpdate().RunAsync());
+        var next = NewRow(18, 1, 2);
+        next.Payload = "02";
+
+        await Assert.ThrowsAsync<NotSupportedException>(() => context.Rows.Upsert(next)
+            .WhenMatched((stored, source) => new Item { Payload = stored.EncodedPayload + source.Payload })
+            .RunAsync());
+        await Assert.ThrowsAsync<NotSupportedException>(() => context.Rows.Upsert(next)
+            .WhenMatched((stored, source) => new Item
+            {
+                EncodedPayload = source.Counter > 0 ? stored.Payload + source.Payload : source.Payload
+            }).RunAsync());
+
+        await using var reader = _database.CreateContext();
+        var saved = await reader.Rows.SingleAsync(row => row.Id == existing.Id);
+        Assert.Equal("001", saved.Payload);
+        Assert.Equal("existing", saved.EncodedPayload);
+        Assert.Equal("db:existing", _database.Scalar(
+            "SELECT \"EncodedPayload\" FROM " + _database.Table + " WHERE \"Id\" = 1801"));
+    }
+
     private static Item NewRow(int bucket, int item, int counter) => new()
     {
         Id = 100 * bucket + item,
@@ -374,18 +554,25 @@ public sealed class LiveDatabase : IDisposable
     private readonly DbContextOptions<LiveContext> _options;
     private readonly string _connection;
     private readonly string _schema;
+    private readonly string _receiptDirectory;
+    private readonly Action<FixtureDdl, string>? _beforeDdl;
+    private readonly List<(string Name, string Receipt)> _createdTables = [];
     private readonly string _tableName = "FLEX_PROBE_" + Guid.NewGuid().ToString("N").ToUpperInvariant();
 
     private string TickerTableName => _tableName + "_TQ";
 
-    public LiveDatabase()
+    public LiveDatabase() : this(null) { }
+
+    internal LiveDatabase(Action<FixtureDdl, string>? beforeDdl)
     {
+        _beforeDdl = beforeDdl;
         try
         {
             if (OperatingSystem.IsWindows())
                 throw new PlatformNotSupportedException("FlexLabs live tests require Unix file permissions.");
             var path = Environment.GetEnvironmentVariable("FLEXLABS_DM_ISOLATION")
                 ?? throw new InvalidOperationException("Run the FlexLabs provision and test script.");
+            _receiptDirectory = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, "flexlabs-fixtures");
             if (File.GetUnixFileMode(path) != (UnixFileMode.UserRead | UnixFileMode.UserWrite))
                 throw new InvalidOperationException("Isolation state must have mode 0600.");
             using var state = JsonDocument.Parse(File.ReadAllText(path));
@@ -408,7 +595,7 @@ public sealed class LiveDatabase : IDisposable
             _options = new DbContextOptionsBuilder<LiveContext>()
                 .UseDamengWithWDriver(_connection)
                 .UseDamengUpsert().Options;
-            Execute($"""
+            CreateTable(_tableName, $"""
                 CREATE TABLE {Table} (
                     "Id" INT PRIMARY KEY,
                     "Bucket" INT NOT NULL,
@@ -418,12 +605,13 @@ public sealed class LiveDatabase : IDisposable
                     "State" VARCHAR(8) NOT NULL,
                     "Stamp" TIMESTAMP(6) NOT NULL,
                     "Payload" VARCHAR(100) NULL,
+                    "EncodedPayload" VARCHAR(120) NULL,
                     "LargePayload" CLOB NULL,
                     "DefaultText" VARCHAR(80) DEFAULT 'server default',
                     UNIQUE ("Bucket", "Part")
                 )
                 """);
-            Execute($"""
+            CreateTable(TickerTableName, $"""
                 CREATE TABLE "{TickerTableName}" (
                     "Id" CHAR(36) PRIMARY KEY,
                     "Status" INT NOT NULL,
@@ -444,11 +632,30 @@ public sealed class LiveDatabase : IDisposable
         }
         catch (Exception error)
         {
-            throw new InvalidOperationException($"FlexLabs live fixture initialization failed ({error.GetType().Name}, 0x{error.HResult:X8}).");
+            var errors = new List<Exception> { Sanitize("initialization", error) };
+            CleanUpTables(errors);
+            throw new AggregateException("FlexLabs live fixture initialization failed. Check local ownership receipts.", errors);
         }
     }
 
     public string Table { get; }
+    internal string MainTableName => _tableName;
+
+    internal bool TableExists(string table)
+    {
+        using var connection = new DmConnection(_connection);
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = :name";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "name";
+        parameter.Value = table;
+        command.Parameters.Add(parameter);
+        return Convert.ToInt32(command.ExecuteScalar()) == 1;
+    }
+
+    internal bool HasOwnershipReceipt(string table)
+        => File.Exists(ReceiptPath(table, confirmed: true)) || File.Exists(ReceiptPath(table, confirmed: false));
     internal LiveContext CreateContext(DbCommandInterceptor? observer = null)
         => new(observer is null ? _options : new DbContextOptionsBuilder<LiveContext>(_options)
             .AddInterceptors(observer).Options, _tableName, TickerTableName, _schema);
@@ -471,19 +678,70 @@ public sealed class LiveDatabase : IDisposable
         command.ExecuteNonQuery();
     }
 
+    private void CreateTable(string table, string sql)
+    {
+        if (OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException("FlexLabs live tests require Unix file permissions.");
+        _beforeDdl?.Invoke(FixtureDdl.Create, table);
+        Directory.CreateDirectory(_receiptDirectory);
+        // Write the exact candidate before issuing auto-committing DDL. An ambiguous
+        // CREATE leaves a receipt, but only acknowledged CREATEs are eligible for DROP.
+        var pending = ReceiptPath(table, confirmed: false);
+        var confirmed = ReceiptPath(table, confirmed: true);
+        using (var stream = new FileStream(pending, new FileStreamOptions
+        {
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.Write,
+            UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite
+        }))
+        {
+            JsonSerializer.Serialize(stream, new { Schema = _schema, Table = table });
+        }
+
+        Execute(sql);
+        _createdTables.Add((table, pending));
+        File.Move(pending, confirmed);
+        _createdTables[^1] = (table, confirmed);
+    }
+
+    private string ReceiptPath(string table, bool confirmed)
+        => Path.Combine(_receiptDirectory, table + (confirmed ? ".created.json" : ".pending.json"));
+
     public void Dispose()
     {
-        try
+        var errors = new List<Exception>();
+        CleanUpTables(errors);
+        if (errors.Count != 0)
+            throw new AggregateException("FlexLabs live fixture cleanup failed. Check local ownership receipts.", errors);
+    }
+
+    private void CleanUpTables(List<Exception> errors)
+    {
+        foreach (var table in _createdTables.AsEnumerable().Reverse().ToArray())
         {
-            Execute($"DROP TABLE \"{TickerTableName}\"");
-            Execute("DROP TABLE " + Table);
-        }
-        catch (Exception error)
-        {
-            throw new InvalidOperationException($"FlexLabs test table cleanup failed ({error.GetType().Name}, 0x{error.HResult:X8}).");
+            try
+            {
+                _beforeDdl?.Invoke(FixtureDdl.Drop, table.Name);
+                Execute($"DROP TABLE \"{table.Name}\"");
+                _createdTables.Remove(table);
+                File.Delete(table.Receipt);
+            }
+            catch (Exception error)
+            {
+                errors.Add(Sanitize("table cleanup", error));
+            }
         }
     }
+
+    private static InvalidOperationException Sanitize(string operation, Exception error)
+    {
+        var serverCode = error is DmException dm ? $", DM {dm.Number}" : "";
+        return new InvalidOperationException(
+            $"FlexLabs fixture {operation} failed ({error.GetType().Name}, 0x{error.HResult:X8}{serverCode}).");
+    }
 }
+
+internal enum FixtureDdl { Create, Drop }
 
 internal sealed class LiveContextFactory(LiveDatabase database) : IDbContextFactory<LiveContext>
 {
@@ -506,7 +764,9 @@ internal sealed class LiveContext(DbContextOptions<LiveContext> options, string 
             value => value == "READY" ? ItemState.Ready : ItemState.Done);
         entity.Property(row => row.Stamp).HasColumnType("TIMESTAMP(6)");
         entity.Property(row => row.Payload).HasMaxLength(100);
-        entity.Property(row => row.LargePayload).HasColumnType("CLOB");
+        entity.Property(row => row.EncodedPayload).HasMaxLength(120)
+            .HasConversion(value => "db:" + value, value => value.Substring(3));
+        entity.Property(row => row.LargePayload).HasColumnType("clob");
         entity.Property(row => row.DefaultText).HasMaxLength(80).HasDefaultValueSql("'server default'");
 
         var ticker = modelBuilder.Entity<CronTickerOccurrenceEntity<CronTickerEntity>>();
@@ -528,6 +788,7 @@ internal sealed class Item
     public ItemState State { get; set; }
     public DateTime Stamp { get; set; }
     public string? Payload { get; set; }
+    public string? EncodedPayload { get; set; }
     public string? LargePayload { get; set; }
     public string? DefaultText { get; set; }
 }
