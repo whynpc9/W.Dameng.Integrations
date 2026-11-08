@@ -206,17 +206,22 @@ internal sealed class DamengStorageConnection(DamengStorage storage) : JobStorag
     public override long GetSetCount(string key) => ItemCount(Set, key);
     public override long GetSetCount(IEnumerable<string> keys, int limit)
     {
+        ArgumentNullException.ThrowIfNull(keys);
         ArgumentOutOfRangeException.ThrowIfNegative(limit);
-        return Read(s =>
-        {
-            long count = 0;
-            foreach (var key in keys.Distinct(StringComparer.Ordinal))
-            {
-                if (count >= limit) break;
-                count += s.Count($"SELECT COUNT(*) {LiveItems}", Set, Key(key));
-            }
-            return Math.Min(count, limit);
-        });
+        if (limit == 0) return 0;
+
+        var digests = keys.Distinct(StringComparer.Ordinal).Select(Key).ToArray();
+        if (digests.Length == 0) return 0;
+
+        var predicate = SqlSession.InParameters("I.K", digests.Length);
+        return Read(s => s.Count($"""
+            SELECT COUNT(*) FROM (
+                SELECT 1 FROM WHF_ITEM I JOIN WHF_COLLECTION C ON C.KIND = I.KIND AND C.K = I.K
+                WHERE I.KIND = 'S' AND {predicate}
+                  AND (C.EXPIRES_UTC IS NULL OR C.EXPIRES_UTC > SYS_EXTRACT_UTC(CURRENT_TIMESTAMP()))
+                LIMIT :p{digests.Length}
+            ) MATCHING_ITEMS
+            """, [.. digests, limit]));
     }
 
     public override List<string> GetRangeFromSet(string key, int startingFrom, int endingAt) =>

@@ -10,6 +10,55 @@ namespace W.Hangfire.Dameng.Tests;
 public sealed partial class StorageTests
 {
     [Fact]
+    public void MultiSetCountCannotDoubleCountAnAtomicMoveBetweenKeys()
+    {
+        var storage = Open();
+        var first = Queue();
+        var second = Queue();
+        var expired = Queue();
+        using var writer = storage.GetConnection();
+        using (var seed = (JobStorageTransaction)writer.CreateWriteTransaction())
+        {
+            seed.AddToSet(first, "member");
+            seed.AddToSet(expired, "expired");
+            seed.ExpireSet(expired, TimeSpan.FromSeconds(-1));
+            seed.Commit();
+        }
+
+        using var reader = (JobStorageConnection)storage.GetConnection();
+        Assert.Equal(1, reader.GetSetCount([first, second, first, expired], 10));
+        Assert.Equal(0, reader.GetSetCount([], 10));
+        Assert.Equal(0, reader.GetSetCount(RejectEnumeration(), 0));
+
+        // The old per-key implementation issued SELECT(first) before asking for
+        // the next key. Move the member in that exact gap on the other connection.
+        Assert.Equal(1, reader.GetSetCount(KeysWithMove(), 10));
+        Assert.Empty(reader.GetAllItemsFromSet(first));
+        Assert.Equal("member", Assert.Single(reader.GetAllItemsFromSet(second)));
+        Assert.Equal(1, Number("""
+            SELECT COUNT(*) FROM WHF_ITEM WHERE KIND = 'S' AND K = :p0
+            """, Digest(second)));
+        Assert.Equal(1, reader.GetSetCount(Enumerable.Range(0, 501).Select(i => first + i).Append(second), 1));
+
+        IEnumerable<string> KeysWithMove()
+        {
+            yield return first;
+            using var move = writer.CreateWriteTransaction();
+            move.RemoveFromSet(first, "member");
+            move.AddToSet(second, "member");
+            move.Commit();
+            yield return second;
+            yield return second;
+        }
+
+        static IEnumerable<string> RejectEnumeration()
+        {
+            yield return ThrowOnRead();
+            static string ThrowOnRead() => throw new InvalidOperationException("Zero limit enumerated keys.");
+        }
+    }
+
+    [Fact]
     public async Task CollectionsParametersAndLargeUnicodePayloadRoundTrip()
     {
         var storage = Open();

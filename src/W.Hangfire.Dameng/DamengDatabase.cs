@@ -138,6 +138,15 @@ internal sealed class SqlSession(DmConnection connection, DmTransaction? transac
 
     internal static T Json<T>(DmDataReader reader, int index) => JsonSerializer.Deserialize<T>(reader.GetString(index))!;
 
+    // Keep each IN list bounded while retaining one statement and one read view.
+    internal static string InParameters(string column, int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
+        var lists = Enumerable.Range(0, count).Chunk(500).Select(indices =>
+            $"{column} IN ({string.Join(", ", indices.Select(i => ":p" + i.ToString(CultureInfo.InvariantCulture)))})");
+        return "(" + string.Join(" OR ", lists) + ")";
+    }
+
     private DmCommand Command(string sql, object?[] values)
     {
         var command = connection.CreateCommand(sql);
