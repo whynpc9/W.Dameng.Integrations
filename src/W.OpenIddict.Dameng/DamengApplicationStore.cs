@@ -21,15 +21,13 @@ internal sealed class DamengApplicationStore<TContext> : OpenIddictEntityFramewo
         {
             var authorizations = Context.Set<OpenIddictEntityFrameworkCoreAuthorization>()
                 .Where(authorization => EF.Property<string>(authorization, StoreWrites.ApplicationId) == application.Id);
-            var tokens = await Context.Set<OpenIddictEntityFrameworkCoreToken>().AsTracking()
+            var tokens = Context.Set<OpenIddictEntityFrameworkCoreToken>()
                 .Where(token => EF.Property<string>(token, StoreWrites.ApplicationId) == application.Id ||
                     authorizations.Any(authorization => authorization.Id ==
-                        EF.Property<string>(token, StoreWrites.AuthorizationId)))
-                .ToListAsync(cancellationToken);
+                        EF.Property<string>(token, StoreWrites.AuthorizationId)));
 
-            Context.RemoveRange(tokens);
-            Context.RemoveRange(await authorizations.AsTracking().ToListAsync(cancellationToken));
-            Context.Entry(application).State = EntityState.Deleted;
-        }, cancellationToken);
+            await GraphDeletePages.DeleteTokensAsync(Context, tokens, cancellationToken);
+            await GraphDeletePages.DeleteAuthorizationsAsync(Context, authorizations, cancellationToken);
+        }, application, cancellationToken);
     }
 }

@@ -449,7 +449,7 @@ public sealed partial class StoreTests(LiveDatabase live, ITestOutputHelper outp
             Assert.Equal(0, cancelAfterSave.RowsWritten);
             var canceled = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => MaintainAsync(cancellation.Token));
             Assert.Equal(cancellation.Token, canceled.CancellationToken);
-            Assert.Equal(deleteGraph ? 4 : 2, cancelAfterSave.RowsWritten);
+            Assert.Equal(2, cancelAfterSave.RowsWritten);
             Assert.Equal(IsolationLevel.Serializable, cancelAfterSave.Isolation);
             Assert.Null(failing.Db.Database.CurrentTransaction);
             Assert.False(failing.Db.ChangeTracker.HasChanges());

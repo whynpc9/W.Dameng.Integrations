@@ -42,7 +42,7 @@ public sealed class LiveDatabase : IAsyncLifetime
             await creator.CreateTablesAsync();
     }
 
-    internal async Task<StoreSession> OpenAsync(bool tracked = false, IInterceptor? interceptor = null, bool native = false)
+    internal async Task<StoreSession> OpenAsync(bool tracked = false, IInterceptor? interceptor = null, bool native = false, IInterceptor? commandProbe = null)
     {
         var services = new ServiceCollection();
         services.AddDbContext<StoreContext>(options =>
@@ -50,6 +50,8 @@ public sealed class LiveDatabase : IAsyncLifetime
             options.UseDamengWithWDriver(connectionString, dameng => dameng.CommandTimeout(20));
             if (interceptor is not null)
                 options.AddInterceptors(interceptor);
+            if (commandProbe is not null)
+                options.AddInterceptors(commandProbe);
         });
         services.AddOpenIddict().AddCore(core =>
         {

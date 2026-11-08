@@ -1,5 +1,6 @@
 using System.Data;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using OpenIddict.Abstractions;
 using static OpenIddict.Abstractions.OpenIddictExceptions;
 
@@ -17,8 +18,20 @@ internal static class StoreWrites
             throw new InvalidOperationException("Dameng OpenIddict stores require UseDamengWithWDriver.");
     }
 
-    internal static async ValueTask<int> SaveTrackedAsync(
-        DbContext context, Func<Task<int>> stage, CancellationToken cancellationToken, bool deleteOnly = false)
+    internal static ValueTask<int> SaveTrackedAsync(
+        DbContext context, Func<Task<int>> stage, CancellationToken cancellationToken, bool deleteOnly = false) =>
+        InTrackedTransactionAsync(context, async () =>
+        {
+            var count = await stage();
+            if (deleteOnly)
+                EnsureOnlyDeletes(context);
+            if (count > 0)
+                await context.SaveChangesAsync(acceptAllChangesOnSuccess: false, cancellationToken);
+            return count;
+        }, cancellationToken);
+
+    private static async ValueTask<int> InTrackedTransactionAsync(
+        DbContext context, Func<Task<int>> write, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var tracker = context.ChangeTracker;
@@ -33,13 +46,7 @@ internal static class StoreWrites
             IsolationLevel.Serializable, cancellationToken);
         try
         {
-            var count = await stage();
-            if (deleteOnly && tracker.Entries().Any(entry => entry.State == EntityState.Modified))
-                throw new InvalidOperationException("Reload the OpenIddict graph in a fresh context before deleting.");
-
-            if (count > 0)
-                await context.SaveChangesAsync(acceptAllChangesOnSuccess: false, cancellationToken);
-
+            var count = await write();
             // Cancellation observed after the last DML must still roll back the local transaction.
             cancellationToken.ThrowIfCancellationRequested();
             await transaction.CommitAsync(cancellationToken);
@@ -57,21 +64,64 @@ internal static class StoreWrites
         }
     }
 
-    internal static async ValueTask DeleteGraphAsync(
-        DbContext context, Func<Task> stage, CancellationToken cancellationToken)
+    internal static async ValueTask DeleteGraphAsync<TEntity>(
+        DbContext context, Func<Task> writeDependents, TEntity root, CancellationToken cancellationToken) where TEntity : class
     {
         try
         {
-            await SaveTrackedAsync(context, async () =>
+            await InTrackedTransactionAsync(context, async () =>
             {
-                await stage();
+                await writeDependents();
+                var entry = context.Entry(root);
+                if (!await TryDeleteNullStampAsync(context, entry, cancellationToken))
+                {
+                    entry.State = EntityState.Deleted;
+                    await SaveDeleteBatchAsync(context, 1, cancellationToken);
+                }
                 return 1;
-            }, cancellationToken, deleteOnly: true);
+            }, cancellationToken);
         }
         catch (DbUpdateConcurrencyException exception)
         {
             throw new ConcurrencyException("An OpenIddict entity changed during deletion. Reload it before retrying.", exception);
         }
+    }
+
+    internal static async Task SaveDeleteBatchAsync(DbContext context, int count, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureOnlyDeletes(context);
+        if (await context.SaveChangesAsync(acceptAllChangesOnSuccess: false, cancellationToken) != count)
+            throw new DbUpdateConcurrencyException("The OpenIddict delete batch did not write the expected number of entries.");
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    internal static async ValueTask<bool> TryDeleteNullStampAsync<TEntity>(
+        DbContext context, EntityEntry<TEntity> entry, CancellationToken cancellationToken) where TEntity : class
+    {
+        if (entry.Property("ConcurrencyToken").OriginalValue is not null)
+            return false;
+
+        // The published EF/WDriver stack binds an unused parameter for a tracked
+        // DELETE with a NULL concurrency token. Use an explicit IS NULL predicate.
+        entry.State = EntityState.Deleted;
+        EnsureOnlyDeletes(context);
+        var id = (string)entry.Property("Id").CurrentValue!;
+        var count = await context.Set<TEntity>()
+            .Where(row => EF.Property<string>(row, "Id") == id &&
+                          EF.Property<string>(row, "ConcurrencyToken") == null)
+            .ExecuteDeleteAsync(cancellationToken);
+        if (count != 1)
+            throw new DbUpdateConcurrencyException("The OpenIddict entity changed before its NULL-stamp delete.");
+        cancellationToken.ThrowIfCancellationRequested();
+        entry.State = EntityState.Detached;
+        return true;
+    }
+
+    private static void EnsureOnlyDeletes(DbContext context)
+    {
+        if (context.ChangeTracker.Entries().Any(entry => entry.State is EntityState.Modified or EntityState.Added))
+            throw new InvalidOperationException("Reload the OpenIddict graph in a fresh context before deleting.");
     }
 
     internal static async ValueTask<long> PruneAsync<TEntity>(
