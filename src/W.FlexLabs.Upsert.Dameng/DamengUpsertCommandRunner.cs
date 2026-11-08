@@ -79,7 +79,7 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
         if (updateExpressions is not null)
         {
             sql += " WHEN MATCHED THEN UPDATE SET " + string.Join(", ", updateExpressions.Select(
-                expression => "t." + EscapeName(expression.ColumnName) + " = " + ExpandValue(expression.Value)));
+                expression => ExpandAssignment(expression.ColumnName, expression.Value)));
             if (updateCondition is not null)
                 sql += " WHERE " + ExpandExpression(updateCondition);
         }
@@ -98,6 +98,22 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
 
         return sql;
     }
+
+    private string ExpandAssignment(string columnName, IKnownValue value)
+    {
+        if (GetColumnKind(columnName) == OperandKind.UnsupportedText && ContainsTextAddition(value))
+            throw new NotSupportedException("Dameng upsert cannot assign string concatenation to a converted string column.");
+
+        return "t." + EscapeName(columnName) + " = " + ExpandValue(value);
+    }
+
+    private bool ContainsTextAddition(IKnownValue? value)
+        => value is KnownExpression expression
+            && ((expression.ExpressionType == ExpressionType.Add
+                    && GetOperandKind(expression) is OperandKind.Text or OperandKind.LobText)
+                || ContainsTextAddition(expression.Value1)
+                || ContainsTextAddition(expression.Value2)
+                || ContainsTextAddition(expression.Value3));
 
     protected override string ExpandExpression(KnownExpression expression, Func<string, string>? expandLeftColumn = null)
     {
@@ -168,7 +184,8 @@ public sealed class DamengUpsertCommandRunner : RelationalUpsertCommandRunner
 
         if (!mappings.All(mapping => mapping.Property.ClrType == typeof(string) && mapping.TypeMapping.Converter is null))
             return OperandKind.UnsupportedText;
-        return mappings.Any(mapping => mapping.TypeMapping.StoreTypeNameBase is "CLOB" or "NCLOB" or "TEXT")
+        return mappings.Any(mapping => mapping.TypeMapping.StoreTypeNameBase.ToUpperInvariant()
+            is "CLOB" or "NCLOB" or "TEXT" or "NTEXT" or "LONGVARCHAR")
             ? OperandKind.LobText
             : OperandKind.Text;
     }

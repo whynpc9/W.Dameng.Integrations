@@ -511,6 +511,34 @@ public sealed class LiveUpsertTests : IClassFixture<LiveDatabase>
         Assert.Equal("001", (await reader.Rows.SingleAsync(row => row.Id == existing.Id)).Payload);
     }
 
+    [Fact]
+    public async Task String_concatenation_rejects_converted_operands_and_destinations()
+    {
+        await using var context = _database.CreateContext();
+        var existing = NewRow(18, 1, 7);
+        existing.Payload = "001";
+        existing.EncodedPayload = "existing";
+        Assert.Equal(1, await context.Rows.Upsert(existing).NoUpdate().RunAsync());
+        var next = NewRow(18, 1, 2);
+        next.Payload = "02";
+
+        await Assert.ThrowsAsync<NotSupportedException>(() => context.Rows.Upsert(next)
+            .WhenMatched((stored, source) => new Item { Payload = stored.EncodedPayload + source.Payload })
+            .RunAsync());
+        await Assert.ThrowsAsync<NotSupportedException>(() => context.Rows.Upsert(next)
+            .WhenMatched((stored, source) => new Item
+            {
+                EncodedPayload = source.Counter > 0 ? stored.Payload + source.Payload : source.Payload
+            }).RunAsync());
+
+        await using var reader = _database.CreateContext();
+        var saved = await reader.Rows.SingleAsync(row => row.Id == existing.Id);
+        Assert.Equal("001", saved.Payload);
+        Assert.Equal("existing", saved.EncodedPayload);
+        Assert.Equal("db:existing", _database.Scalar(
+            "SELECT \"EncodedPayload\" FROM " + _database.Table + " WHERE \"Id\" = 1801"));
+    }
+
     private static Item NewRow(int bucket, int item, int counter) => new()
     {
         Id = 100 * bucket + item,
@@ -577,6 +605,7 @@ public sealed class LiveDatabase : IDisposable
                     "State" VARCHAR(8) NOT NULL,
                     "Stamp" TIMESTAMP(6) NOT NULL,
                     "Payload" VARCHAR(100) NULL,
+                    "EncodedPayload" VARCHAR(120) NULL,
                     "LargePayload" CLOB NULL,
                     "DefaultText" VARCHAR(80) DEFAULT 'server default',
                     UNIQUE ("Bucket", "Part")
@@ -735,7 +764,9 @@ internal sealed class LiveContext(DbContextOptions<LiveContext> options, string 
             value => value == "READY" ? ItemState.Ready : ItemState.Done);
         entity.Property(row => row.Stamp).HasColumnType("TIMESTAMP(6)");
         entity.Property(row => row.Payload).HasMaxLength(100);
-        entity.Property(row => row.LargePayload).HasColumnType("CLOB");
+        entity.Property(row => row.EncodedPayload).HasMaxLength(120)
+            .HasConversion(value => "db:" + value, value => value.Substring(3));
+        entity.Property(row => row.LargePayload).HasColumnType("clob");
         entity.Property(row => row.DefaultText).HasMaxLength(80).HasDefaultValueSql("'server default'");
 
         var ticker = modelBuilder.Entity<CronTickerOccurrenceEntity<CronTickerEntity>>();
@@ -757,6 +788,7 @@ internal sealed class Item
     public ItemState State { get; set; }
     public DateTime Stamp { get; set; }
     public string? Payload { get; set; }
+    public string? EncodedPayload { get; set; }
     public string? LargePayload { get; set; }
     public string? DefaultText { get; set; }
 }
