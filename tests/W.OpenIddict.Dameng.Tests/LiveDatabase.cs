@@ -1,4 +1,3 @@
-using System.Data;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
@@ -8,7 +7,7 @@ using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using OpenIddict.Abstractions;
 using OpenIddict.EntityFrameworkCore;
-using W.Dm;
+using W.OpenIddict.Dameng.Testing;
 using Xunit;
 
 namespace W.OpenIddict.Dameng.Tests;
@@ -16,6 +15,8 @@ namespace W.OpenIddict.Dameng.Tests;
 public sealed class LiveDatabase : IAsyncLifetime
 {
     private FileStream? runLock;
+    private string user = null!;
+    private string tablespace = null!;
     private string connectionString = null!;
 
     public async Task InitializeAsync()
@@ -27,23 +28,15 @@ public sealed class LiveDatabase : IAsyncLifetime
         using var state = JsonDocument.Parse(File.ReadAllText(path));
         var root = state.RootElement;
         Assert.Equal("ready", root.GetProperty("Status").GetString());
-        var user = root.GetProperty("User").GetString()!;
-        var tablespace = root.GetProperty("Tablespace").GetString()!;
+        user = root.GetProperty("User").GetString()!;
+        tablespace = root.GetProperty("Tablespace").GetString()!;
         Assert.Matches(new Regex(@"^OID_U_[0-9A-F]{20}$"), user);
         Assert.Matches(new Regex(@"^OID_TS_[0-9A-F]{20}$"), tablespace);
         Assert.True(user[6..] == tablespace[7..], "Fixture user and tablespace must belong to the same allocation.");
 
         connectionString = root.GetProperty("ConnectionString").GetString()!;
-        await using var connection = new DmConnection(connectionString);
-        await connection.OpenAsync();
-        await using var verify = connection.CreateCommand();
-        verify.CommandText = "SELECT USER, DEFAULT_TABLESPACE FROM USER_USERS";
-        await using var reader = await verify.ExecuteReaderAsync();
-        Assert.True(await reader.ReadAsync());
-        Assert.True(user == reader.GetString(0) && tablespace == reader.GetString(1),
-            "Fixture connection must use its owned schema and tablespace.");
-
         await using var session = await OpenAsync();
+        await VerifyAsync(session.Db);
         var creator = (IRelationalDatabaseCreator)session.Db.GetService<IDatabaseCreator>();
         if (!await creator.HasTablesAsync())
             await creator.CreateTablesAsync();
@@ -81,8 +74,11 @@ public sealed class LiveDatabase : IAsyncLifetime
         }
     }
 
-    internal static async Task ResetAsync(StoreContext db)
+    private Task VerifyAsync(StoreContext db) => OwnedSchema.VerifyAsync(db.Database.GetDbConnection(), user, tablespace);
+
+    internal async Task ResetAsync(StoreContext db)
     {
+        await VerifyAsync(db);
         await db.Database.ExecuteSqlRawAsync("""DELETE FROM "OpenIddictTokens" """);
         await db.Database.ExecuteSqlRawAsync("""DELETE FROM "OpenIddictAuthorizations" """);
         await db.Database.ExecuteSqlRawAsync("""DELETE FROM "OpenIddictApplications" """);

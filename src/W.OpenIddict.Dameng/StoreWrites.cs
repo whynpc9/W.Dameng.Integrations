@@ -20,6 +20,7 @@ internal static class StoreWrites
     internal static async ValueTask<int> SaveTrackedAsync(
         DbContext context, Func<Task<int>> stage, CancellationToken cancellationToken, bool deleteOnly = false)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var tracker = context.ChangeTracker;
         if (!tracker.AutoDetectChangesEnabled)
             tracker.DetectChanges();
@@ -39,6 +40,8 @@ internal static class StoreWrites
             if (count > 0)
                 await context.SaveChangesAsync(acceptAllChangesOnSuccess: false, cancellationToken);
 
+            // Cancellation observed after the last DML must still roll back the local transaction.
+            cancellationToken.ThrowIfCancellationRequested();
             await transaction.CommitAsync(cancellationToken);
             tracker.AcceptAllChanges();
             return count;
