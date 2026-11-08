@@ -20,15 +20,12 @@ internal sealed class DamengAuthorizationStore<TContext> : OpenIddictEntityFrame
         ArgumentNullException.ThrowIfNull(authorization);
         ArgumentException.ThrowIfNullOrEmpty(authorization.Id);
 
-        return StoreWrites.DeleteGraphAsync(Context, async () =>
-        {
-            var tokens = await Context.Set<OpenIddictEntityFrameworkCoreToken>().AsTracking()
-                .Where(token => EF.Property<string>(token, StoreWrites.AuthorizationId) == authorization.Id)
-                .ToListAsync(cancellationToken);
+        var tokens = Context.Set<OpenIddictEntityFrameworkCoreToken>()
+            .Where(token => EF.Property<string>(token, StoreWrites.AuthorizationId) == authorization.Id);
 
-            Context.RemoveRange(tokens);
-            Context.Entry(authorization).State = EntityState.Deleted;
-        }, cancellationToken);
+        return StoreWrites.DeleteGraphAsync(Context,
+            () => GraphDeletePages.DeleteTokensAsync(Context, tokens, cancellationToken),
+            authorization, cancellationToken);
     }
 
     public override ValueTask<long> PruneAsync(DateTimeOffset threshold, CancellationToken cancellationToken)
